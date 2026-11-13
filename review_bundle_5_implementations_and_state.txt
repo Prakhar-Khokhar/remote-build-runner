@@ -1,0 +1,1285 @@
+=================================================================================
+REVIEW BUNDLE 5 of 7 - STATE-FIELD DECLARATIONS + LIFECYCLE IMPLEMENTATION INDEX
+=================================================================================
+Generated (UTC): 2026-11-13 18:08:04 UTC
+Sources: /home/prakhar/Github Projects/knewstuff/src/core/jobs/*
+All excerpts below are VERBATIM from the working-tree files (no source was
+modified while producing this bundle). Line numbers refer to the current file
+contents on disk.
+
+CONTENTS
+--------
+PART A : State-field declarations (ExtractionEntry struct, manager members,
+         job Private struct, worker state fields) + summary inventory table.
+PART B : Complete verbatim implementations of every lifecycle function,
+         grouped by responsibility.
+PART C : Ordering / invariant analysis (entry lifecycle state machine).
+
+
+-------------------------------------------------------------------------------
+PART A : STATE-FIELD DECLARATIONS
+-------------------------------------------------------------------------------
+
+===== ArchiveExtractionManager::ExtractionEntry struct (manager.cpp:33-74)  (archiveextractionmanager.cpp:33-74) =====
+33: struct ArchiveExtractionManager::ExtractionEntry
+34: {
+35:     enum class State { Starting, Running, Finishing, Reaping, Done };
+36:     QString payloadFile;
+37:     QString installDir;
+38:     ArchiveExtractionJob::UncompressionOption uncompressionOption = ArchiveExtractionJob::NeverUncompress;
+39:     QPointer<ArchiveExtractionJob> job = nullptr;
+40:     std::shared_ptr<std::atomic<bool>> cancellation;
+41:     int handle = -1;
+42:     std::atomic<State> state{State::Starting};
+43:     QThread *thread = nullptr;
+44:     ArchiveExtractionWorker *worker = nullptr;
+45: 
+46:     // Finalization flags (independent notifications):
+47:     // resultClaimed - worker result accepted for processing (set before invoking handlers)
+48:     // resultDisposed - job notification / payload disposition complete
+49:     // threadReaped   - wait(0) succeeded and QThread deleted
+50:     std::atomic<bool> resultClaimed{false};
+51:     std::atomic<bool> resultDisposed{false};
+52:     std::atomic<bool> threadReaped{false};
+53: 
+54:     // Non-blocking reap retry state
+55:     bool reapRetryScheduled = false;
+56: 
+57:     // Payload cleanup retry state
+58:     bool payloadCleanupRetryScheduled = false;
+59: 
+60:     // Set to true when payload cleanup (QFile::remove) fails. The entry is not
+61:     // released from the manager's tracking vector until the payload is
+62:     // successfully removed or confirmed absent.
+63:     std::atomic<bool> payloadCleanupPending{false};
+64: 
+65:     // Set to true when handleWorkerFinished observes a dead job (QPointer null).
+66:     // Used by cleanupPayloadIfNeeded to decide whether an unconsumed payload may be removed.
+67:     std::atomic<bool> jobDead{false};
+68: 
+69:     // Test-only: callback to capture worker's terminal result even after job destruction
+70:     std::function<void(ArchiveExtractionWorker::ResultType)> testWorkerResultCallback;
+71: 
+72:     // Test-only: suppress the queued interruption fallback in requestCancellation()
+73:     bool testSuppressInterruptionFallback = false;
+74: };
+===== end archiveextractionmanager.cpp:33-74 =====
+===== ArchiveExtractionManager class members (manager.h:75-101)  (archiveextractionmanager.h:75-101) =====
+ 75: private:
+ 76:     struct ExtractionEntry;
+ 77: 
+ 78:     std::atomic<int> m_nextHandle{0};
+ 79:     mutable QMutex m_entriesMutex;
+ 80:     std::vector<std::shared_ptr<ExtractionEntry>> m_entries;
+ 81: 
+ 82:     // Test-only: when true, the next startExtraction simulates a failed thread start.
+ 83:     bool m_testForceStartFailure = false;
+ 84: 
+ 85:     // Test-only: when true, payload removal in cleanupPayloadIfNeeded simulates
+ 86:     // failure, exercising the payload cleanup retry path.
+ 87:     bool m_testPayloadRemoveFailure = false;
+ 88: 
+ 89:     ArchiveExtractionManager(QObject *parent = nullptr);
+ 90: 
+ 91:     ExtractionEntry* findEntry(int handle);
+ 92:     void reapEntry(ExtractionEntry *entry);
+ 93:     void scheduleReapRetry(int handle);
+ 94:     void onReapTimer(int handle);
+ 95:     bool tryFinalize(std::shared_ptr<ExtractionEntry> entry);
+ 96:     void releaseEntryFromVector(std::shared_ptr<ExtractionEntry> entry);
+ 97:     void deliverSyntheticFailure(std::shared_ptr<ExtractionEntry> entry,
+ 98:                                  const QString &errorMessage);
+ 99:     void cleanupPayloadIfNeeded(std::shared_ptr<ExtractionEntry> entry);
+100:     void schedulePayloadCleanupRetry(int handle);
+101:     void onPayloadCleanupTimer(int handle);
+===== end archiveextractionmanager.h:75-101 =====
+===== ArchiveExtractionJobPrivate state fields (job.cpp:20-49)  (archiveextractionjob.cpp:20-49) =====
+20: class KNSCore::ArchiveExtractionJobPrivate
+21: {
+22: public:
+23:     QString payloadFile;
+24:     QString installDir;
+25:     ArchiveExtractionJob::UncompressionOption uncompressionOption = ArchiveExtractionJob::NeverUncompress;
+26: 
+27:     QStringList installedFiles;
+28:     bool finished = false;
+29:     bool killRequested = false;
+30:     bool startCalled = false;
+31:     int extractionHandle = -1;
+32: 
+33:     // Test-only: allow setting test mode on worker before start()
+34:     std::shared_ptr<QSemaphore> testBarrierAfterStarted;
+35:     std::shared_ptr<QSemaphore> testBarrierBeforeCopyTo;
+36:     std::shared_ptr<QSemaphore> testBarrierBeforeCancellationCheck;
+37:     std::function<void()> testWorkerStartedCallback;
+38:     std::function<void()> testBeforeCopyToCallback;
+39:     std::function<void()> testBeforeCancellationCheckCallback;
+40:     std::function<void()> testAboutToCopyToCallback;
+41:     std::function<void()> testPreCopyToCallback;
+42:     std::function<void(ArchiveExtractionWorker::ResultType)> testWorkerResultCallback;
+43: 
+44:     // Standard resource directory (e.g., "wallpaper") for special fallback behavior
+45:     QString standardResourceDirectory;
+46: 
+47:     // Cancellation flag shared with manager entry
+48:     std::shared_ptr<std::atomic<bool>> cancellation;
+49: };
+===== end archiveextractionjob.cpp:20-49 =====
+===== ArchiveExtractionWorker state fields (worker.h:69-90)  (archiveextractionworker.h:69-90) =====
+69: private:
+70:     class Private;
+71:     const std::unique_ptr<Private> d;
+72: 
+73:     // Test-only seams
+74:     std::shared_ptr<QSemaphore> m_testBarrierAfterStarted;
+75:     std::shared_ptr<QSemaphore> m_testBarrierBeforeCopyTo;
+76:     std::shared_ptr<QSemaphore> m_testBarrierBeforeCancellationCheck;
+77:     std::function<void()> m_testStartedCallback;
+78:     std::function<void()> m_testBeforeCopyToCallback;
+79:     std::function<void()> m_testBeforeCancellationCheckCallback;
+80:     std::function<void()> m_testAboutToCopyToCallback;
+81:     std::function<void()> m_testPreCopyToCallback;
+82: 
+83:     // Cancellation state shared with manager/job
+84:     std::shared_ptr<std::atomic<bool>> m_cancellation;
+85: 
+86:     // Resource directory type (e.g., "wallpaper") for special fallback behavior
+87:     QString m_standardResourceDirectory;
+88: 
+89:     // Helper to check if cancellation has been requested (shared flag or thread interruption)
+90:     bool isCancellationRequested() const;
+===== end archiveextractionworker.h:69-90 =====
+===== ArchiveExtractionWorker::Private fields (worker.cpp:31-37)  (archiveextractionworker.cpp:31-37) =====
+31: class KNSCore::ArchiveExtractionWorker::Private
+32: {
+33: public:
+34:     QString payloadFile;
+35:     QString installDir;
+36:     UncompressionOption uncompressionOption = NeverUncompress;
+37: };
+===== end archiveextractionworker.cpp:31-37 =====
+
+-------------------------------------------------------------------------------
+A5 : SUMMARY INVENTORY TABLE  (field | type | mutating thread | purpose)
+-------------------------------------------------------------------------------
+ExtractionEntry.state            | std::atomic<State> (Starting|Running|Finishing|Reaping|Done) | manager thread (mostly)  | lifecycle state of one extraction
+ExtractionEntry.resultClaimed    | std::atomic<bool>            | manager thread           | worker result accepted for processing (reentrancy guard)
+ExtractionEntry.resultDisposed   | std::atomic<bool>            | manager thread           | job notification / payload disposition complete
+ExtractionEntry.threadReaped     | std::atomic<bool>            | manager thread           | wait(0) succeeded and QThread deleted
+ExtractionEntry.reapRetryScheduled| bool (mutex-guarded)         | manager thread           | only one reap retry outstanding per entry
+ExtractionEntry.payloadCleanupRetryScheduled | bool (mutex-guarded) | manager thread | only one payload-cleanup retry outstanding
+ExtractionEntry.payloadCleanupPending | std::atomic<bool>        | manager thread           | payload removal failed; entry not released until removed/absent
+ExtractionEntry.jobDead          | std::atomic<bool>            | manager thread           | handleWorkerFinished observed a dead job (QPointer null)
+ExtractionEntry.testWorkerResultCallback | std::function           | manager thread           | captures worker terminal result even after job destruction
+ExtractionEntry.testSuppressInterruptionFallback | bool           | manager thread           | suppress queued interruption fallback in requestCancellation()
+ExtractionEntry.cancellation     | shared_ptr<atomic<bool>>     | any (thread-safe atomic) | shared cancellation flag with job
+ExtractionEntry.thread           | QThread*                     | manager thread           | worker's QThread
+ExtractionEntry.worker           | ArchiveExtractionWorker*     | manager thread           | worker (deleteLater'd on thread.finished)
+ExtractionEntry.job              | QPointer<ArchiveExtractionJob>| manager thread           | owning job (auto-nulls on destruction)
+ExtractionEntry.handle / payloadFile / installDir / uncompressionOption | plain members | manager thread | entry identity and payload description
+
+ArchiveExtractionManager::m_nextHandle  | std::atomic<int>  | manager thread  | monotonic handle allocator
+ArchiveExtractionManager::m_entriesMutex | QMutex             | manager thread  | guards m_entries vector
+ArchiveExtractionManager::m_entries     | vector<shared_ptr<ExtractionEntry>> | manager thread | active entry tracking
+ArchiveExtractionManager::m_testForceStartFailure | bool        | manager thread  | test seam: simulate failed thread start
+ArchiveExtractionManager::m_testPayloadRemoveFailure | bool       | manager thread  | test seam: simulate payload removal failure
+
+ArchiveExtractionJobPrivate::finished      | bool  | job thread (main)  | emitResult already called
+ArchiveExtractionJobPrivate::killRequested | bool  | job thread (main)  | kill() invoked before start
+ArchiveExtractionJobPrivate::startCalled   | bool  | job thread (main)  | start() already invoked
+ArchiveExtractionJobPrivate::extractionHandle | int | manager thread (set before result delivery) | handle assigned by manager
+ArchiveExtractionJobPrivate::cancellation  | shared_ptr<atomic<bool>> | shared | cancellation flag shared with manager entry
+
+ArchiveExtractionWorker::m_cancellation | shared_ptr<atomic<bool>> | any thread-safe | shared cancellation flag
+ArchiveExtractionWorker::m_testBarrier*/m_test*Callback | test seams | worker thread | synchronization test seams
+
+
+-------------------------------------------------------------------------------
+PART B : LIFECYCLE FUNCTION IMPLEMENTATIONS (VERBATIM WITH LINE NUMBERS)
+-------------------------------------------------------------------------------
+
+===== B1 : startExtraction  -- entry creation + handle assignment + thread/worker start  (archiveextractionmanager.cpp:95-302) =====
+ 95: int ArchiveExtractionManager::startExtraction(const QString &payloadFile,
+ 96:                                               const QString &installDir,
+ 97:                                               ArchiveExtractionJob::UncompressionOption uncompressionOption,
+ 98:                                               ArchiveExtractionJob *job)
+ 99: {
+100:     // Must be called from manager's thread (main thread)
+101:     Q_ASSERT(QThread::currentThread() == thread());
+102: 
+103:     const int handle = m_nextHandle.fetch_add(1, std::memory_order_relaxed);
+104: 
+105:     auto entry = std::make_shared<ExtractionEntry>();
+106:     entry->payloadFile = payloadFile;
+107:     entry->installDir = installDir;
+108:     entry->uncompressionOption = uncompressionOption;
+109:     entry->job = job;
+110:     entry->handle = handle;
+111:     entry->state.store(ExtractionEntry::State::Starting, std::memory_order_release);
+112: 
+113:     // Share the job's cancellation flag with the manager entry
+114:     if (job) {
+115:         entry->cancellation = job->cancellationFlag();
+116:     } else {
+117:         entry->cancellation = std::make_shared<std::atomic<bool>>(false);
+118:     }
+119: 
+120:     // Store entry before starting thread (so cancellation/job destruction can find it)
+121:     {
+122:         QMutexLocker locker(&m_entriesMutex);
+123:         if (static_cast<size_t>(handle) >= m_entries.size()) {
+124:             m_entries.resize(handle + 1);
+125:         }
+126:         m_entries[handle] = entry;
+127:     }
+128: 
+129:     ExtractionEntry *storedEntry = entry.get();
+130:     Q_ASSERT(storedEntry);
+131: 
+132:     // Install job-destruction observation BEFORE any result delivery.
+133:     // This ensures that even if startExtraction() synchronously emits a
+134:     // result (e.g., synthetic failure), the manager can track job destruction
+135:     // and release the entry once both notifications are complete.
+136:     if (storedEntry->job) {
+137:         QObject::connect(storedEntry->job, &QObject::destroyed,
+138:                          this, [this, handle]() {
+139:             QMetaObject::invokeMethod(this, [this, handle]() {
+140:                 std::shared_ptr<ExtractionEntry> e;
+141:                 {
+142:                     QMutexLocker locker(&m_entriesMutex);
+143:                     if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+144:                         e = m_entries[handle];
+145:                     }
+146:                 }
+147:                 if (!e) {
+148:                     return;
+149:                 }
+150:                 e->jobDead.store(true, std::memory_order_release);
+151:                 if (e->resultDisposed.load(std::memory_order_acquire)
+152:                     && e->threadReaped.load(std::memory_order_acquire)) {
+153:                     cleanupPayloadIfNeeded(e);
+154:                 }
+155:                 tryFinalize(e);
+156:             }, Qt::QueuedConnection);
+157:         }, Qt::DirectConnection);
+158:     }
+159: 
+160:     // Set the extraction handle on the job BEFORE any result delivery.
+161:     // If startExtraction() synchronously emits a result (e.g., synthetic
+162:     // failure) and the result handler destroys the job, the job destructor
+163:     // will see d->finished == true (set before emitResult in handleExtractionFailed)
+164:     // and will skip requestCancellation, leaving entry finalization to
+165:     // deliverSyntheticFailure -> tryFinalize, which is already in progress.
+166:     // The job-destruction connection installed above ensures the manager
+167:     // observes job destruction and releases the entry.
+168:     // Set the extraction handle on the job BEFORE any result delivery.
+169:     // If startExtraction() synchronously emits a result (e.g., synthetic
+170:     // failure) and the result handler destroys the job, the job will have a
+171:     // valid handle. The job destructor checks d->finished (set before
+172:     // emitResult in handleExtractionFailed) and skips requestCancellation,
+173:     // leaving entry finalization to deliverSyntheticFailure -> tryFinalize.
+174:     // The job-destruction connection installed above ensures the manager
+175:     // observes job destruction and releases the entry.
+176:     if (storedEntry->job) {
+177:         storedEntry->job->setExtractionHandle(handle);
+178:     }
+179: 
+180:     // Corrected startup sequence: start the thread BEFORE creating/moving the worker.
+181:     // This avoids moving a worker into a thread whose native creation failed.
+182:     QThread *newThread = new QThread();
+183:     entry->thread = newThread;
+184: 
+185:     bool started = false;
+186:     if (m_testForceStartFailure) {
+187:         // Deterministic test seam: simulate a failed native thread start.
+188:         started = false;
+189:     } else {
+190:         newThread->start();
+191:         started = newThread->isRunning();
+192:     }
+193: 
+194:     if (!started) {
+195:         // Failed-start path: no worker was ever created or moved, so no consumer
+196:         // can claim the payload. Clean it up directly, finalize the entry, and
+197:         // report a synthetic terminal extraction failure.
+198:         delete newThread;
+199:         entry->thread = nullptr;
+200:         entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+201:         entry->threadReaped.store(true, std::memory_order_release);
+202: 
+203:         if (!entry->payloadFile.isEmpty() && QFileInfo::exists(entry->payloadFile)) {
+204:             // Test-only: simulate payload removal failure to exercise the retry path.
+205:             if (m_testPayloadRemoveFailure) {
+206:                 entry->payloadCleanupPending.store(true, std::memory_order_release);
+207:                 schedulePayloadCleanupRetry(entry->handle);
+208:                 qCWarning(KNEWSTUFFCORE) << "Payload removal (simulated failure)"
+209:                                          << entry->payloadFile << "after thread start failure; will retry";
+210:             } else if (!QFile::remove(entry->payloadFile)) {
+211:                 // Payload removal failed. Retry later; do not release the entry
+212:                 // until the payload is confirmed removed.
+213:                 entry->payloadCleanupPending.store(true, std::memory_order_release);
+214:                 schedulePayloadCleanupRetry(entry->handle);
+215:                 qCWarning(KNEWSTUFFCORE) << "Failed to remove payload" << entry->payloadFile
+216:                                          << "after thread start failure; will retry";
+217:             }
+218:         }
+219: 
+220:         deliverSyntheticFailure(entry, QStringLiteral("Archive extraction thread could not be started"));
+221:         return handle;
+222:     }
+223: 
+224:     // Thread started successfully.
+225: 
+226:     // Create the worker on the manager thread.
+227:     entry->worker = new ArchiveExtractionWorker(payloadFile, installDir,
+228:         static_cast<ArchiveExtractionWorker::UncompressionOption>(uncompressionOption),
+229:         entry->cancellation);
+230: 
+231:     if (job) {
+232:         if (auto b = job->testBarrierAfterStarted()) {
+233:             entry->worker->setBarrierAfterStarted(b);
+234:         }
+235:         if (auto b = job->testBarrierBeforeCopyTo()) {
+236:             entry->worker->setBarrierBeforeCopyTo(b);
+237:         }
+238:         if (auto b = job->testBarrierBeforeCancellationCheck()) {
+239:             entry->worker->setBarrierBeforeCancellationCheck(b);
+240:         }
+241:         if (job->testWorkerStartedCallback()) {
+242:             entry->worker->setTestStartedCallback(job->testWorkerStartedCallback());
+243:         }
+244:         if (job->testBeforeCopyToCallback()) {
+245:             entry->worker->setTestBeforeCopyToCallback(job->testBeforeCopyToCallback());
+246:         }
+247:         if (job->testBeforeCancellationCheckCallback()) {
+248:             entry->worker->setTestBeforeCancellationCheckCallback(job->testBeforeCancellationCheckCallback());
+249:         }
+250:         if (job->testAboutToCopyToCallback()) {
+251:             entry->worker->setTestAboutToCopyToCallback(job->testAboutToCopyToCallback());
+252:         }
+253:         if (job->testPreCopyToCallback()) {
+254:             entry->worker->setTestPreCopyToCallback(job->testPreCopyToCallback());
+255:         }
+256:         if (!job->standardResourceDirectory().isEmpty()) {
+257:             entry->worker->setStandardResourceDirectory(job->standardResourceDirectory());
+258:         }
+259:         // Capture test worker result callback in entry so it persists after job destruction
+260:         if (job->testWorkerResultCallback()) {
+261:             entry->testWorkerResultCallback = job->testWorkerResultCallback();
+262:         }
+263:     }
+264: 
+265:     entry->worker->moveToThread(newThread);
+266: 
+267:     // Connections:
+268:     // 1. Worker finished -> thread quit (DirectConnection, thread-safe)
+269:     // 2. Worker finished -> manager.handleWorkerFinished (QueuedConnection, crosses to main thread)
+270:     // 3. Thread finished -> worker.deleteLater (DirectConnection, runs during thread shutdown)
+271:     // 4. Thread finished -> manager.reapEntry (QueuedConnection, crosses to main thread)
+272: 
+273:     QObject::connect(storedEntry->worker, &ArchiveExtractionWorker::finished,
+274:                      newThread, &QThread::quit, Qt::DirectConnection);
+275: 
+276:     QObject::connect(storedEntry->worker, &ArchiveExtractionWorker::finished,
+277:                      this, [this, handle](ArchiveExtractionWorker::ResultType result,
+278:                                           const QStringList &files,
+279:                                           const QString &errorMessage) {
+280:         QMetaObject::invokeMethod(this, [this, handle, result, files, errorMessage]() {
+281:             handleWorkerFinished(handle, result, files, errorMessage);
+282:         }, Qt::QueuedConnection);
+283:     }, Qt::DirectConnection);
+284: 
+285:     QObject::connect(newThread, &QThread::finished,
+286:                      storedEntry->worker, &QObject::deleteLater, Qt::DirectConnection);
+287: 
+288:     QObject::connect(newThread, &QThread::finished,
+289:                      this, [this, handle]() {
+290:         QMetaObject::invokeMethod(this, [this, handle]() {
+291:             ExtractionEntry *entry = findEntry(handle);
+292:             if (entry) {
+293:                 reapEntry(entry);
+294:             }
+295:         }, Qt::QueuedConnection);
+296:     }, Qt::DirectConnection);
+297: 
+298:     storedEntry->state.store(ExtractionEntry::State::Running, std::memory_order_release);
+299:     QMetaObject::invokeMethod(storedEntry->worker, "start", Qt::QueuedConnection);
+300: 
+301:     return handle;
+302: }
+===== end archiveextractionmanager.cpp:95-302 =====
+===== B2 : job-destruction observation block (inside startExtraction) -- DirectConnection destroyed() -> queued invokeMethod -> jobDead  (archiveextractionmanager.cpp:132-158) =====
+132:     // Install job-destruction observation BEFORE any result delivery.
+133:     // This ensures that even if startExtraction() synchronously emits a
+134:     // result (e.g., synthetic failure), the manager can track job destruction
+135:     // and release the entry once both notifications are complete.
+136:     if (storedEntry->job) {
+137:         QObject::connect(storedEntry->job, &QObject::destroyed,
+138:                          this, [this, handle]() {
+139:             QMetaObject::invokeMethod(this, [this, handle]() {
+140:                 std::shared_ptr<ExtractionEntry> e;
+141:                 {
+142:                     QMutexLocker locker(&m_entriesMutex);
+143:                     if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+144:                         e = m_entries[handle];
+145:                     }
+146:                 }
+147:                 if (!e) {
+148:                     return;
+149:                 }
+150:                 e->jobDead.store(true, std::memory_order_release);
+151:                 if (e->resultDisposed.load(std::memory_order_acquire)
+152:                     && e->threadReaped.load(std::memory_order_acquire)) {
+153:                     cleanupPayloadIfNeeded(e);
+154:                 }
+155:                 tryFinalize(e);
+156:             }, Qt::QueuedConnection);
+157:         }, Qt::DirectConnection);
+158:     }
+===== end archiveextractionmanager.cpp:132-158 =====
+===== B3 : handleWorkerFinished -- worker terminal result delivery + resultDisposed + jobDead + direct-reap attempt + tryFinalize  (archiveextractionmanager.cpp:347-437) =====
+347: void ArchiveExtractionManager::handleWorkerFinished(int handle,
+348:                                                     ArchiveExtractionWorker::ResultType result,
+349:                                                     const QStringList &files,
+350:                                                     const QString &errorMessage)
+351: {
+352:     // Must be called from manager's thread (main thread)
+353:     Q_ASSERT(QThread::currentThread() == thread());
+354: 
+355:     std::shared_ptr<ExtractionEntry> entry;
+356:     {
+357:         QMutexLocker locker(&m_entriesMutex);
+358:         if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+359:             entry = m_entries[handle];
+360:         }
+361:     }
+362: 
+363:     if (!entry) {
+364:         return; // Already reaped/finalized
+365:     }
+366: 
+367:     // Reentrancy guard: duplicate or reentrant result notifications are harmless.
+368:     if (entry->resultClaimed.exchange(true, std::memory_order_acq_rel)) {
+369:         return;
+370:     }
+371: 
+372:     // Capture QPointer before dispatching; never dereference after a handler may emit result.
+373:     QPointer<ArchiveExtractionJob> job = entry->job;
+374: 
+375:     // The worker's emitted result is authoritative. Do NOT override Success/FallbackRequired
+376:     // with Cancelled based on a late-arriving cancellation flag.
+377:     if (job) {
+378:         if (entry->job->testWorkerResultCallback()) {
+379:             entry->job->testWorkerResultCallback()(result);
+380:         }
+381:         switch (result) {
+382:             case ArchiveExtractionWorker::Success:
+383:                 entry->job->handleSuccess(files);
+384:                 break;
+385:             case ArchiveExtractionWorker::FallbackRequired:
+386:                 entry->job->handleFallbackRequired();
+387:                 break;
+388:             case ArchiveExtractionWorker::ExtractionFailed:
+389:                 entry->job->handleExtractionFailed(errorMessage);
+390:                 break;
+391:             case ArchiveExtractionWorker::Cancelled:
+392:                 entry->job->handleCancelled();
+393:                 break;
+394:         }
+395:     } else {
+396:         if (entry->testWorkerResultCallback) {
+397:             entry->testWorkerResultCallback(result);
+398:         }
+399:     }
+400: 
+401:     // Result disposition is complete from the manager's perspective once handlers ran.
+402:     entry->resultDisposed.store(true, std::memory_order_release);
+403: 
+404:     if (!job) {
+405:         // Job object already destroyed before result delivery. No live consumer remains.
+406:         entry->jobDead.store(true, std::memory_order_release);
+407:         // If the thread is already reaped, clean up any unconsumed payload now.
+408:         // Otherwise reapEntry will handle it once threadReaped becomes true.
+409:         if (entry->threadReaped.load(std::memory_order_acquire)) {
+410:             cleanupPayloadIfNeeded(entry);
+411:         }
+412:     }
+413: 
+414:     // Attempt direct reaping if the thread has already finished.
+415:     QThread *workerThread = entry->thread;
+416:     if (workerThread && !entry->threadReaped.load(std::memory_order_acquire)) {
+417:         if (!workerThread->isRunning() && workerThread->wait(0)) {
+418:             delete workerThread;
+419:             entry->thread = nullptr;
+420:             entry->worker = nullptr;
+421:             entry->threadReaped.store(true, std::memory_order_release);
+422:             // If the job is dead, clean up any unconsumed payload now that
+423:             // both result delivery and physical reaping are complete.
+424:             if (entry->jobDead.load(std::memory_order_acquire)) {
+425:                 cleanupPayloadIfNeeded(entry);
+426:             }
+427:         } else if (workerThread->isRunning()) {
+428:             entry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+429:             scheduleReapRetry(handle);
+430:             return;
+431:         }
+432:     }
+433: 
+434:     // Physical reaping happens independently via reapEntry (scheduled by thread.finished).
+435:     // Finalize only when both resultDisposed && threadReaped are true.
+436:     tryFinalize(entry);
+437: }
+===== end archiveextractionmanager.cpp:347-437 =====
+===== B4 : deliverSyntheticFailure -- synthetic terminal failure for a thread that failed to start  (archiveextractionmanager.cpp:439-456) =====
+439: void ArchiveExtractionManager::deliverSyntheticFailure(std::shared_ptr<ExtractionEntry> entry,
+440:                                                        const QString &errorMessage)
+441: {
+442:     // Synthetic terminal failure for a thread that failed to start.
+443:     // No worker was ever created/moved, so no worker result exists; report failure directly.
+444:     QPointer<ArchiveExtractionJob> job = entry->job;
+445:     entry->resultClaimed.store(true, std::memory_order_release);
+446: 
+447:     if (job) {
+448:         entry->job->handleExtractionFailed(errorMessage);
+449:     }
+450: 
+451:     entry->resultDisposed.store(true, std::memory_order_release);
+452:     if (entry->jobDead.load(std::memory_order_acquire) || entry->job.isNull()) {
+453:         cleanupPayloadIfNeeded(entry);
+454:     }
+455:     tryFinalize(entry);
+456: }
+===== end archiveextractionmanager.cpp:439-456 =====
+===== B5 : cleanupPayloadIfNeeded -- remove unconsumed payload only when resultDisposed && threadReaped  (archiveextractionmanager.cpp:458-490) =====
+458: void ArchiveExtractionManager::cleanupPayloadIfNeeded(std::shared_ptr<ExtractionEntry> entry)
+459: {
+460:     // Remove an unconsumed temp payload only when both notifications are complete:
+461:     // resultDisposed (job notification/payload disposition complete) AND
+462:     // threadReaped (worker finished using the payload). The caller is responsible
+463:     // for ensuring no live job remains to consume the payload (checked via jobDead
+464:     // flag or QPointer::isNull() before calling this function).
+465:     // QFileInfo::exists guards against double-removal when a live fallback
+466:     // handler already renamed the file.
+467:     if (!entry->resultDisposed.load(std::memory_order_acquire)
+468:         || !entry->threadReaped.load(std::memory_order_acquire)) {
+469:         return;
+470:     }
+471: 
+472:     const QString &payload = entry->payloadFile;
+473:     if (!payload.isEmpty() && QFileInfo::exists(payload)) {
+474:         // Test-only: simulate payload removal failure to exercise the retry path.
+475:         if (m_testPayloadRemoveFailure) {
+476:             entry->payloadCleanupPending.store(true, std::memory_order_release);
+477:             schedulePayloadCleanupRetry(entry->handle);
+478:             return;
+479:         }
+480:         if (!QFile::remove(payload)) {
+481:             // Payload removal failed. Retry later; do not consider cleanup done.
+482:             entry->payloadCleanupPending.store(true, std::memory_order_release);
+483:             schedulePayloadCleanupRetry(entry->handle);
+484:             qCWarning(KNEWSTUFFCORE) << "Failed to remove leftover payload" << payload
+485:                                      << "for handle" << entry->handle
+486:                                      << QFile().errorString();
+487:             return;
+488:         }
+489:     }
+490: }
+===== end archiveextractionmanager.cpp:458-490 =====
+===== B6 : schedulePayloadCleanupRetry -- single-outstanding 15ms timer retry  (archiveextractionmanager.cpp:612-638) =====
+612: void ArchiveExtractionManager::schedulePayloadCleanupRetry(int handle)
+613: {
+614:     if (handle < 0) {
+615:         return;
+616:     }
+617: 
+618:     // Ensure only one retry is outstanding per entry.
+619:     std::shared_ptr<ExtractionEntry> e;
+620:     {
+621:         QMutexLocker locker(&m_entriesMutex);
+622:         if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+623:             e = m_entries[handle];
+624:         }
+625:     }
+626:     if (!e) {
+627:         return;
+628:     }
+629:     if (e->payloadCleanupRetryScheduled) {
+630:         return;
+631:     }
+632:     e->payloadCleanupRetryScheduled = true;
+633: 
+634:     // Context-bound single-shot timer on the manager; modest non-zero interval.
+635:     QTimer::singleShot(15, this, [this, handle]() {
+636:         onPayloadCleanupTimer(handle);
+637:     });
+638: }
+===== end archiveextractionmanager.cpp:612-638 =====
+===== B7 : onPayloadCleanupTimer -- retry removal, unbounded reschedule, tryFinalize on success  (archiveextractionmanager.cpp:640-682) =====
+640: void ArchiveExtractionManager::onPayloadCleanupTimer(int handle)
+641: {
+642:     Q_ASSERT(QThread::currentThread() == thread());
+643: 
+644:     std::shared_ptr<ExtractionEntry> e;
+645:     {
+646:         QMutexLocker locker(&m_entriesMutex);
+647:         if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+648:             e = m_entries[handle];
+649:         }
+650:     }
+651: 
+652:     if (!e) {
+653:         return; // Entry already finalized; stale callback is a no-op.
+654:     }
+655: 
+656:     e->payloadCleanupRetryScheduled = false;
+657: 
+658:     // Test-only: simulate payload removal failure to exercise repeated retries.
+659:     if (m_testPayloadRemoveFailure) {
+660:         e->payloadCleanupPending.store(true, std::memory_order_release);
+661:         schedulePayloadCleanupRetry(handle);
+662:         qCWarning(KNEWSTUFFCORE) << "Payload cleanup retry (simulated failure) for"
+663:                                  << e->payloadFile << "handle" << handle;
+664:         return;
+665:     }
+666: 
+667:     // Retry payload removal. If the file is already gone, cleanup is considered
+668:     // done. If removal still fails, reschedule another retry (no arbitrary limit).
+669:     if (!e->payloadFile.isEmpty() && QFileInfo::exists(e->payloadFile)) {
+670:         if (!QFile::remove(e->payloadFile)) {
+671:             e->payloadCleanupPending.store(true, std::memory_order_release);
+672:             schedulePayloadCleanupRetry(handle);
+673:             qCWarning(KNEWSTUFFCORE) << "Payload cleanup retry failed for" << e->payloadFile
+674:                                      << "handle" << handle << QFile().errorString();
+675:             return;
+676:         }
+677:     }
+678: 
+679:     // Payload is now confirmed removed. Clear the pending flag and finalize.
+680:     e->payloadCleanupPending.store(false, std::memory_order_release);
+681:     tryFinalize(e);
+682: }
+===== end archiveextractionmanager.cpp:640-682 =====
+===== B8 : tryFinalize -- finalization invariant resultDisposed && threadReaped; entry release gating  (archiveextractionmanager.cpp:684-731) =====
+684: bool ArchiveExtractionManager::tryFinalize(std::shared_ptr<ExtractionEntry> entry)
+685: {
+686:     if (!entry) {
+687:         return false;
+688:     }
+689: 
+690:     // Finalization invariant: both result delivery and physical reaping must be complete.
+691:     if (!entry->resultDisposed.load(std::memory_order_acquire)
+692:         || !entry->threadReaped.load(std::memory_order_acquire)) {
+693:         return false;
+694:     }
+695: 
+696:     if (entry->state.load(std::memory_order_acquire) == ExtractionEntry::State::Done) {
+697:         // Already marked Done. Clean up payload if job is dead, then release entry
+698:         // only if payload cleanup is not pending.
+699:         if (entry->jobDead.load(std::memory_order_acquire)
+700:             || entry->job.isNull()) {
+701:             cleanupPayloadIfNeeded(entry);
+702:         }
+703:         if (!entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+704:             releaseEntryFromVector(entry);
+705:         }
+706:         return true;
+707:     }
+708: 
+709:     // Clean up any unconsumed payload only if the job is dead (no live consumer).
+710:     // A live fallback handler may still consume/rename the payload; the manager
+711:     // must not remove it before that handler has returned.
+712:     if (entry->jobDead.load(std::memory_order_acquire)
+713:         || entry->job.isNull()) {
+714:         cleanupPayloadIfNeeded(entry);
+715:     }
+716: 
+717:     entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+718: 
+719:     // Do NOT remove from vector yet if the job is still alive — the job's
+720:     // destroyed signal callback will call tryFinalize again (Done branch),
+721:     // which will set jobDead, clean up payload, and release the entry.
+722:     // Also do NOT remove if payload cleanup is pending (removal failed); the
+723:     // payload cleanup retry will call tryFinalize again once the payload is gone.
+724:     if ((entry->jobDead.load(std::memory_order_acquire)
+725:          || entry->job.isNull())
+726:         && !entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+727:         releaseEntryFromVector(entry);
+728:     }
+729: 
+730:     return true;
+731: }
+===== end archiveextractionmanager.cpp:684-731 =====
+===== B9 : releaseEntryFromVector -- mutex-guarded m_entries[handle].reset()  (archiveextractionmanager.cpp:806-812) =====
+806: void ArchiveExtractionManager::releaseEntryFromVector(std::shared_ptr<ExtractionEntry> entry)
+807: {
+808:     QMutexLocker locker(&m_entriesMutex);
+809:     if (entry->handle >= 0 && entry->handle < static_cast<int>(m_entries.size())) {
+810:         m_entries[entry->handle].reset();
+811:     }
+812: }
+===== end archiveextractionmanager.cpp:806-812 =====
+===== B10 : reapEntry -- physical reaping of the QThread  (archiveextractionmanager.cpp:492-561) =====
+492: void ArchiveExtractionManager::reapEntry(ExtractionEntry *entry)
+493: {
+494:     // Must be called from manager's thread (main thread)
+495:     Q_ASSERT(QThread::currentThread() == thread());
+496: 
+497:     if (!entry) {
+498:         return;
+499:     }
+500: 
+501:     auto currentState = entry->state.load(std::memory_order_acquire);
+502:     if (currentState == ExtractionEntry::State::Done) {
+503:         return; // Already finalized
+504:     }
+505:     if (currentState == ExtractionEntry::State::Reaping) {
+506:         return; // Reaping in progress, avoid reentrancy
+507:     }
+508: 
+509:     entry->state.store(ExtractionEntry::State::Reaping, std::memory_order_release);
+510: 
+511:     // Obtain a shared_ptr that shares ownership with the vector's entry,
+512:     // so the entry cannot be destroyed while we are working on it.
+513:     std::shared_ptr<ExtractionEntry> sharedEntry;
+514:     {
+515:         QMutexLocker locker(&m_entriesMutex);
+516:         if (entry->handle >= 0 && entry->handle < static_cast<int>(m_entries.size())) {
+517:             sharedEntry = m_entries[entry->handle];
+518:         }
+519:     }
+520:     if (!sharedEntry) {
+521:         return; // Entry already finalized
+522:     }
+523: 
+524:     QThread *workerThread = sharedEntry->thread;
+525: 
+526:     if (!workerThread) {
+527:         // No thread (startup failure or test mode); physical side already complete.
+528:         sharedEntry->threadReaped.store(true, std::memory_order_release);
+529:         tryFinalize(sharedEntry);
+530:         return;
+531:     }
+532: 
+533:     if (workerThread->isRunning()) {
+534:         // Thread has not yet stopped. Reset state so a later retry can proceed;
+535:         // do not call quit() as a substitute for joining; the worker's
+536:         // finished->thread.quit connection remains responsible for stopping.
+537:         // Schedule a retry; do not block the GUI thread.
+538:         sharedEntry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+539:         scheduleReapRetry(sharedEntry->handle);
+540:         return;
+541:     }
+542: 
+543:     // Thread has finished. Attempt non-blocking join.
+544:     if (!workerThread->wait(0)) {
+545:         // join/cleanup still ongoing (e.g. TLS destructors). Reset state so a
+546:         // later retry can proceed, then schedule a retry.
+547:         sharedEntry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+548:         scheduleReapRetry(sharedEntry->handle);
+549:         return;
+550:     }
+551: 
+552:     // wait(0) returned true for a thread known to have started successfully: safe to delete.
+553:     delete workerThread;
+554:     sharedEntry->thread = nullptr;
+555:     sharedEntry->worker = nullptr; // already deleteLater'd via thread.finished connection
+556: 
+557:     sharedEntry->threadReaped.store(true, std::memory_order_release);
+558: 
+559:     // tryFinalize defers removal if the job is still alive (waits for destroyed signal).
+560:     tryFinalize(sharedEntry);
+561: }
+===== end archiveextractionmanager.cpp:492-561 =====
+===== B11 : scheduleReapRetry + onReapTimer -- non-blocking reap retry  (archiveextractionmanager.cpp:563-610) =====
+563: void ArchiveExtractionManager::scheduleReapRetry(int handle)
+564: {
+565:     if (handle < 0) {
+566:         return;
+567:     }
+568: 
+569:     // Ensure only one retry is outstanding per entry.
+570:     std::shared_ptr<ExtractionEntry> e;
+571:     {
+572:         QMutexLocker locker(&m_entriesMutex);
+573:         if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+574:             e = m_entries[handle];
+575:         }
+576:     }
+577:     if (!e) {
+578:         return;
+579:     }
+580:     if (e->reapRetryScheduled) {
+581:         return;
+582:     }
+583:     e->reapRetryScheduled = true;
+584: 
+585:     // Context-bound single-shot timer on the manager; modest non-zero interval.
+586:     // 15 ms gives the extraction thread time to complete TLS cleanup without busy-spinning.
+587:     QTimer::singleShot(15, this, [this, handle]() {
+588:         onReapTimer(handle);
+589:     });
+590: }
+591: 
+592: void ArchiveExtractionManager::onReapTimer(int handle)
+593: {
+594:     Q_ASSERT(QThread::currentThread() == thread());
+595: 
+596:     std::shared_ptr<ExtractionEntry> e;
+597:     {
+598:         QMutexLocker locker(&m_entriesMutex);
+599:         if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+600:             e = m_entries[handle];
+601:         }
+602:     }
+603: 
+604:     if (!e) {
+605:         return; // Entry already finalized; stale callback is a no-op.
+606:     }
+607: 
+608:     e->reapRetryScheduled = false;
+609:     reapEntry(e.get());
+610: }
+===== end archiveextractionmanager.cpp:563-610 =====
+===== B12 : waitForAllFinished -- bounded wait for all entries to reach Done  (archiveextractionmanager.cpp:733-761) =====
+733: bool ArchiveExtractionManager::waitForAllFinished(int timeoutMs)
+734: {
+735:     Q_ASSERT(QThread::currentThread() == thread());
+736: 
+737:     QElapsedTimer timer;
+738:     timer.start();
+739: 
+740:     while (true) {
+741:         int active = 0;
+742:         {
+743:             QMutexLocker locker(&m_entriesMutex);
+744:             for (const auto &entry : m_entries) {
+745:                 if (entry && entry->state.load(std::memory_order_acquire) != ExtractionEntry::State::Done) {
+746:                     active++;
+747:                 }
+748:             }
+749:         }
+750: 
+751:         if (active == 0) {
+752:             return true;
+753:         }
+754: 
+755:         if (timer.elapsed() >= timeoutMs) {
+756:             return false;
+757:         }
+758: 
+759:         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+760:     }
+761: }
+===== end archiveextractionmanager.cpp:733-761 =====
+===== B13 : activeExtractionsCount  (archiveextractionmanager.cpp:763-773) =====
+763: int ArchiveExtractionManager::activeExtractionsCount() const
+764: {
+765:     QMutexLocker locker(&m_entriesMutex);
+766:     int count = 0;
+767:     for (const auto &entry : m_entries) {
+768:         if (entry && entry->state.load(std::memory_order_acquire) != ExtractionEntry::State::Done) {
+769:             count++;
+770:         }
+771:     }
+772:     return count;
+773: }
+===== end archiveextractionmanager.cpp:763-773 =====
+===== B14 : ArchiveExtractionJob::~ArchiveExtractionJob -- destructor (skips requestCancellation when finished)  (archiveextractionjob.cpp:61-75) =====
+61: ArchiveExtractionJob::~ArchiveExtractionJob()
+62: {
+63:     // If kill was requested but start was never called, clean up the payload
+64:     if (d->killRequested && !d->startCalled) {
+65:         QFile::remove(d->payloadFile);
+66:     }
+67: 
+68:     // If the job hasn't finished yet (destroyed while worker is running),
+69:     // request cancellation. If the job already finished, the manager has
+70:     // already cleaned up via QThread::finished → reapEntry.
+71:     if (d->extractionHandle != -1 && !d->finished) {
+72:         d->cancellation->store(true, std::memory_order_release);
+73:         ArchiveExtractionManager::instance().requestCancellation(d->extractionHandle);
+74:     }
+75: }
+===== end archiveextractionjob.cpp:61-75 =====
+===== B15 : ArchiveExtractionJob::start -- post-C4: does NOT touch d after startExtraction() returns  (archiveextractionjob.cpp:77-104) =====
+ 77: void ArchiveExtractionJob::start()
+ 78: {
+ 79:     if (d->startCalled) {
+ 80:         return;
+ 81:     }
+ 82:     d->startCalled = true;
+ 83: 
+ 84:     // If kill was requested before start, finish immediately with KilledJobError
+ 85:     // and clean up the payload since no worker will be created to handle it.
+ 86:     if (d->killRequested) {
+ 87:         QFile::remove(d->payloadFile);
+ 88:         if (!error()) {
+ 89:             setError(KJob::KilledJobError);
+ 90:             setErrorText(i18n("Archive extraction was cancelled"));
+ 91:             emitResult();
+ 92:         } else if (error() == KJob::KilledJobError && errorText().isEmpty()) {
+ 93:             setErrorText(i18n("Archive extraction was cancelled"));
+ 94:         }
+ 95:         return;
+ 96:     }
+ 97: 
+ 98:     // Start extraction through the manager. The manager assigns the extraction
+ 99:     // handle via setExtractionHandle() before any result delivery. We must not
+100:     // access d after this call returns: a synchronous result handler may have
+101:     // destroyed the job, freeing d.
+102:     ArchiveExtractionManager::instance().startExtraction(
+103:         d->payloadFile, d->installDir, d->uncompressionOption, this);
+104: }
+===== end archiveextractionjob.cpp:77-104 =====
+===== B16 : ArchiveExtractionJob::setExtractionHandle -- manager-assigned handle (C4)  (archiveextractionjob.cpp:221-224) =====
+221: void ArchiveExtractionJob::setExtractionHandle(int handle)
+222: {
+223:     d->extractionHandle = handle;
+224: }
+===== end archiveextractionjob.cpp:221-224 =====
+===== B17 : ArchiveExtractionJob::doKill -- cooperative cancellation  (archiveextractionjob.cpp:226-246) =====
+226: bool ArchiveExtractionJob::doKill()
+227: {
+228:     d->cancellation->store(true, std::memory_order_release);
+229:     d->killRequested = true;
+230: 
+231:     // If already finished, nothing to do
+232:     if (d->finished) {
+233:         return true;
+234:     }
+235: 
+236:     // If extraction hasn't started yet, we can finish immediately
+237:     if (d->extractionHandle == -1) {
+238:         return true;
+239:     }
+240: 
+241:     // Request cancellation through manager
+242:     ArchiveExtractionManager::instance().requestCancellation(d->extractionHandle);
+243: 
+244:     // Return false - job will finish when worker completes and emits result
+245:     return false;
+246: }
+===== end archiveextractionjob.cpp:226-246 =====
+===== B18 : ArchiveExtractionJob::handle* -- d->finished guard, emitResult()  (archiveextractionjob.cpp:248-302) =====
+248: void ArchiveExtractionJob::handleSuccess(const QStringList &files)
+249: {
+250:     // Must be called from the job's owning thread (main thread)
+251:     Q_ASSERT(QThread::currentThread() == thread());
+252: 
+253:     qCDebug(KNEWSTUFFCORE) << "Job handleSuccess called, finished=" << d->finished << "isFinished=" << isFinished();
+254:     if (d->finished || isFinished()) {
+255:         return;
+256:     }
+257:     d->finished = true;
+258:     d->installedFiles = files;
+259:     qCDebug(KNEWSTUFFCORE) << "Job emitting result signal";
+260:     emitResult();
+261: }
+262: 
+263: void ArchiveExtractionJob::handleFallbackRequired()
+264: {
+265:     // Must be called from the job's owning thread (main thread)
+266:     Q_ASSERT(QThread::currentThread() == thread());
+267: 
+268:     if (d->finished || isFinished()) {
+269:         return;
+270:     }
+271:     d->finished = true;
+272:     setProperty("fallbackRequired", true);
+273:     emitResult();
+274: }
+275: 
+276: void ArchiveExtractionJob::handleExtractionFailed(const QString &errorMessage)
+277: {
+278:     // Must be called from the job's owning thread (main thread)
+279:     Q_ASSERT(QThread::currentThread() == thread());
+280: 
+281:     if (d->finished || isFinished()) {
+282:         return;
+283:     }
+284:     d->finished = true;
+285:     setError(KJob::UserDefinedError);
+286:     setErrorText(errorMessage);
+287:     emitResult();
+288: }
+289: 
+290: void ArchiveExtractionJob::handleCancelled()
+291: {
+292:     // Must be called from the job's owning thread (main thread)
+293:     Q_ASSERT(QThread::currentThread() == thread());
+294: 
+295:     if (d->finished || isFinished()) {
+296:         return;
+297:     }
+298:     d->finished = true;
+299:     setError(KJob::KilledJobError);
+300:     setErrorText(i18n("Archive extraction was cancelled"));
+301:     emitResult();
+302: }
+===== end archiveextractionjob.cpp:248-302 =====
+===== B19 : ArchiveExtractionWorker::doWork -- emits started(), finished(ResultType,...) at every terminal checkpoint  (archiveextractionworker.cpp:68-331) =====
+ 68: void ArchiveExtractionWorker::doWork()
+ 69: {
+ 70:     QStringList installedFiles;
+ 71:     ResultType result = Success;
+ 72:     QString errorMessage;
+ 73:     bool isArchive = true;
+ 74: 
+ 75:     // Test seam: allow test to block after started() is emitted
+ 76:     Q_EMIT started();
+ 77:     if (m_testStartedCallback) {
+ 78:         m_testStartedCallback();
+ 79:     }
+ 80:     if (m_testBarrierAfterStarted) {
+ 81:         m_testBarrierAfterStarted->acquire();
+ 82:     }
+ 83: 
+ 84:     qCDebug(KNEWSTUFFCORE) << "Worker doWork started for" << d->payloadFile;
+ 85: 
+ 86:     // Check for cancellation before starting
+ 87:     if (isCancellationRequested()) {
+ 88:         QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+ 89:         Q_EMIT finished(Cancelled, QStringList(), QString());
+ 90:         return;
+ 91:     }
+ 92: 
+ 93:     ArchiveExtractionWorker::UncompressionOption uncompressionOpt = d->uncompressionOption;
+ 94: 
+ 95:     // Respect the uncompress flag
+ 96:     if (uncompressionOpt == AlwaysUncompress || uncompressionOpt == UncompressIntoSubdirIfArchive
+ 97:         || uncompressionOpt == UncompressIfArchive || uncompressionOpt == UncompressIntoSubdir) {
+ 98: 
+ 99:         // Check MIME type to determine if it's an archive
+100:         QMimeDatabase db;
+101:         QMimeType mimeType = db.mimeTypeForFile(d->payloadFile);
+102: 
+103:         QScopedPointer<KArchive> archive;
+104: 
+105:         if (mimeType.inherits(QStringLiteral("application/zip"))) {
+106:             archive.reset(new KZip(d->payloadFile));
+107:         } else if (mimeType.inherits(QStringLiteral("application/tar"))
+108:                 || mimeType.inherits(QStringLiteral("application/x-tar"))
+109:                 || mimeType.inherits(QStringLiteral("application/x-gzip"))
+110:                 || mimeType.inherits(QStringLiteral("application/x-bzip"))
+111:                 || mimeType.inherits(QStringLiteral("application/x-lzma"))
+112:                 || mimeType.inherits(QStringLiteral("application/x-xz"))
+113:                 || mimeType.inherits(QStringLiteral("application/x-bzip-compressed-tar"))
+114:                 || mimeType.inherits(QStringLiteral("application/x-compressed-tar"))) {
+115:             archive.reset(new KTar(d->payloadFile));
+116:         } else {
+117:             // Unknown MIME type
+118:             if (uncompressionOpt == AlwaysUncompress || uncompressionOpt == UncompressIntoSubdir) {
+119:                 // Wallpaper fallback: non-archive wallpapers should use FallbackRequired
+120:                 if (m_standardResourceDirectory == QLatin1String("wallpaper")) {
+121:                     result = FallbackRequired;
+122:                     Q_EMIT finished(result, QStringList(), QString());
+123:                     return;
+124:                 }
+125:                 // Not a wallpaper: treat as extraction failure
+126:                 errorMessage = i18n("Could not determine the type of archive of the downloaded file %1", d->payloadFile);
+127:                 result = ExtractionFailed;
+128:                 QFile::remove(d->payloadFile); // No consumer for verified paths; clean up.
+129:                 Q_EMIT finished(result, QStringList(), errorMessage);
+130:                 return;
+131:             }
+132:             // For UncompressIfArchive, UncompressIntoSubdirIfArchive:
+133:             // treat as non-archive (will emit FallbackRequired)
+134:             isArchive = false;
+135:         }
+136: 
+137:         if (isArchive) {
+138:             // Check for cancellation before opening archive
+139:             if (isCancellationRequested()) {
+140:                 QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+141:                 Q_EMIT finished(Cancelled, QStringList(), QString());
+142:                 return;
+143:             }
+144: 
+145:             bool success = archive->open(QIODevice::ReadOnly);
+146:             if (!success) {
+147:                 // Archive open failure - recognized archive type but corrupt/unreadable
+148:                 // Wallpaper fallback does NOT apply here - only for non-archive files (unknown MIME type)
+149:                 if (uncompressionOpt == AlwaysUncompress) {
+150:                     errorMessage = i18n("Failed to open the archive file %1. The reported error was: %2", d->payloadFile, archive->errorString());
+151:                     result = ExtractionFailed;
+152:                     QFile::remove(d->payloadFile); // No consumer for verified paths; clean up.
+153:                     Q_EMIT finished(result, QStringList(), errorMessage);
+154:                     return;
+155:                 }
+156:                 // For UncompressIfArchive and UncompressIntoSubdirIfArchive: fall back to non-archive handling
+157:                 if (uncompressionOpt == UncompressIfArchive || uncompressionOpt == UncompressIntoSubdirIfArchive) {
+158:                     // Cancellation checkpoint before emitting FallbackRequired
+159:                     if (isCancellationRequested()) {
+160:                         archive->close();
+161:                         QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+162:                         Q_EMIT finished(Cancelled, QStringList(), QString());
+163:                         return;
+164:                     }
+165:                     result = FallbackRequired;
+166:                     Q_EMIT finished(result, QStringList(), QString());
+167:                     return;
+168:                 }
+169:                 // UncompressIntoSubdir: archive open failure is an extraction failure
+170:                 errorMessage = i18n("Failed to open the archive file %1. The reported error was: %2", d->payloadFile, archive->errorString());
+171:                 result = ExtractionFailed;
+172:                 QFile::remove(d->payloadFile); // No consumer for verified paths; clean up.
+173:                 Q_EMIT finished(result, QStringList(), errorMessage);
+174:                 return;
+175:             }
+176:         }
+177: 
+178:         if (isArchive) {
+179:             const KArchiveDirectory *dir = archive->directory();
+180:             if (!dir) {
+181:                 // Defensive: archive opened but has no root directory
+182:                 errorMessage = i18n("Archive %1 has no valid root directory", d->payloadFile);
+183:                 result = ExtractionFailed;
+184:                 archive->close();
+185:                 QFile::remove(d->payloadFile);
+186:                 Q_EMIT finished(result, QStringList(), errorMessage);
+187:                 return;
+188:             }
+189:             // If there is more than an item in the file, and we are requested to do so
+190:             // put contents in a subdirectory with the same name as the file
+191:             QString installPath;
+192:             const bool isSubdir =
+193:                 (uncompressionOpt == UncompressIntoSubdir || uncompressionOpt == UncompressIntoSubdirIfArchive) && dir->entries().count() > 1;
+194:             if (isSubdir) {
+195:                 installPath = d->installDir + QLatin1Char('/') + QFileInfo(d->payloadFile).baseName();
+196:             } else {
+197:                 installPath = d->installDir;
+198:             }
+199: 
+200:             // Protect destination with per-destination mutex
+201:             QMutex* destMutex = KNSCore::getDestinationMutex(installPath);
+202:             qCDebug(KNEWSTUFFCORE) << "Acquiring mutex for" << installPath;
+203:             QMutexLocker locker(destMutex);
+204:             qCDebug(KNEWSTUFFCORE) << "Mutex acquired for" << installPath;
+205: 
+206:             // Test seam: allow test to block after mutex acquisition but before cancellation check
+207:             if (m_testBeforeCancellationCheckCallback) {
+208:                 m_testBeforeCancellationCheckCallback();
+209:             }
+210:             if (m_testBarrierBeforeCancellationCheck) {
+211:                 m_testBarrierBeforeCancellationCheck->acquire();
+212:             }
+213: 
+214:             if (isCancellationRequested()) {
+215:                 archive->close(); // Archive was opened, close it before removing payload
+216:                 QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+217:                 Q_EMIT finished(Cancelled, QStringList(), QString());
+218:                 return;
+219:             }
+220: 
+221:             // Test seam: allow test to block before copyTo
+222:             Q_EMIT aboutToCopyTo();
+223:             if (m_testAboutToCopyToCallback) {
+224:                 m_testAboutToCopyToCallback();
+225:             }
+226:             if (m_testBeforeCopyToCallback) {
+227:                 m_testBeforeCopyToCallback();
+228:             }
+229:             if (m_testBarrierBeforeCopyTo) {
+230:                 m_testBarrierBeforeCopyTo->acquire();
+231:             }
+232: 
+233:             // Cancellation checkpoint after barrierBeforeCopyTo and before copyTo().
+234:             // This allows tests to verify cancellation can prevent copyTo() from starting.
+235:             // Note: if cancellation arrives while worker is in copyTo(), it will only be
+236:             // observed after copyTo() returns (see checkpoint below).
+237:             if (isCancellationRequested()) {
+238:                 archive->close(); // Archive was opened, close it before removing payload
+239:                 QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+240:                 Q_EMIT finished(Cancelled, QStringList(), QString());
+241:                 return;
+242:             }
+243: 
+244:             // Test-only observation point: fires after the pre-copyTo cancellation checkpoint
+245:             // but before the actual copyTo() call. Proves the checkpoint was passed.
+246:             if (m_testPreCopyToCallback) {
+247:                 m_testPreCopyToCallback();
+248:             }
+249: 
+250:             // copyTo() is not interruptible; if cancellation is requested during extraction,
+251:             // it will only take effect after copyTo() completes. The worker checks for
+252:             // interruption after copyTo() returns and will then clean up and emit Cancelled.
+253:             // The destination directory may be partially populated; no rollback is performed.
+254:             qCDebug(KNEWSTUFFCORE) << "Starting copyTo to" << installPath;
+255:             bool copySuccess = dir->copyTo(installPath);
+256:             qCDebug(KNEWSTUFFCORE) << "copyTo finished, success=" << copySuccess;
+257: 
+258:             if (isCancellationRequested()) {
+259:                 archive->close(); // Archive was opened, close it before removing payload
+260:                 QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+261:                 Q_EMIT finished(Cancelled, QStringList(), QString());
+262:                 return;
+263:             }
+264: 
+265:             if (copySuccess) {
+266:                 // If we extracted the subdir we want to save it using the /* notation
+267:                 if (isSubdir) {
+268:                     installedFiles << QDir(installPath).absolutePath() + QLatin1String("/*");
+269:                 } else {
+270:                     // Collect all installed files
+271:                     const auto lst = dir->entries();
+272:                     for (const QString &entry : lst) {
+273:                         const auto currentEntry = dir->entry(entry);
+274:                         const QString childPath = QDir(installPath).filePath(entry);
+275:                         if (currentEntry->isFile()) {
+276:                             installedFiles << childPath;
+277:                         } else if (currentEntry->isDirectory()) {
+278:                             installedFiles << childPath + QStringLiteral("/*");
+279:                         }
+280:                     }
+281:                 }
+282:                 // If copyTo succeeded but no files were extracted, treat as extraction failure
+283:                 // (corrupt/empty archive) rather than success with empty list.
+284:                 if (installedFiles.isEmpty()) {
+285:                     // Empty/corrupt archive - wallpaper fallback does NOT apply
+286:                     errorMessage = i18n("Archive %1 is empty or corrupt", d->payloadFile);
+287:                     result = ExtractionFailed;
+288:                     archive->close();
+289:                     QFile::remove(d->payloadFile);
+290:                     Q_EMIT finished(result, QStringList(), errorMessage);
+291:                     return;
+292:                 }
+293:             } else {
+294:                 // copyTo() failure: no installed files can be produced, and no caller can retry
+295:                 // or consume the payload (installNonArchiveFile is not invoked for ExtractionFailed).
+296:                 // Treat as extraction failure and clean up the payload.
+297:                 qCWarning(KNEWSTUFFCORE) << "could not install" << d->payloadFile << "to" << installPath;
+298:                 errorMessage = i18n("Failed to extract archive %1 to %2", d->payloadFile, installPath);
+299:                 result = ExtractionFailed;
+300:                 archive->close();
+301:                 QFile::remove(d->payloadFile);
+302:                 Q_EMIT finished(result, QStringList(), errorMessage);
+303:                 return;
+304:             }
+305: 
+306:             archive->close();
+307:             QFile::remove(d->payloadFile);
+308:         }
+309:     }
+310: 
+311:     // If not an archive, determine the result type
+312:     if (!isArchive) {
+313:         // For UncompressIntoSubdir with unknown MIME or archive open failure: empty list = failure
+314:         // For UncompressIfArchive/UncompressIntoSubdirIfArchive: fallback required
+315:         if (uncompressionOpt == UncompressIfArchive || uncompressionOpt == UncompressIntoSubdirIfArchive) {
+316:             // Cancellation checkpoint before emitting FallbackRequired
+317:             if (isCancellationRequested()) {
+318:                 QFile::remove(d->payloadFile); // Cancelled: no fallback, clean up payload.
+319:                 Q_EMIT finished(Cancelled, QStringList(), QString());
+320:                 return;
+321:             }
+322:             result = FallbackRequired;
+323:         } else {
+324:             // UncompressIntoSubdir, AlwaysUncompress (already handled above), NeverUncompress
+325:             result = Success; // empty installedFiles will be treated as failure by caller
+326:         }
+327:     }
+328: 
+329:     qCDebug(KNEWSTUFFCORE) << "Worker doWork finished, emitting finished with result" << result;
+330:     Q_EMIT finished(result, installedFiles, errorMessage);
+331: }
+===== end archiveextractionworker.cpp:68-331 =====

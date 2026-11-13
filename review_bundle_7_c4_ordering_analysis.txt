@@ -1,0 +1,545 @@
+=================================================================================
+REVIEW BUNDLE 7 of 7 - C4 ORDERING INVESTIGATION + testCompletedEntryReleased SEMANTICS
+=================================================================================
+Generated (UTC): 2026-11-13 18:16:53 UTC
+
+SCOPE
+-----
+(7.1) Investigation (test NOT modified): is the job actually destroyed before
+      ArchiveExtractionManager::startExtraction() returns on the C4
+      synthetic-failure path? Answered with a standalone Qt/KF6 probe
+      (source in PART D) that mirrors the exact shape of the C4 path.
+(7.2) Semantics of testCompletedEntryReleased (what it proves / does not prove).
+(7.3) Relevant source excerpts (verbatim) for cross-reference.
+
+
+-------------------------------------------------------------------------------
+7.1 : IS THE JOB DESTROYED BEFORE startExtraction() RETURNS?  (C4 ordering)
+-------------------------------------------------------------------------------
+
+SHORT ANSWER
+------------
+No. On the C4 synthetic-failure path, ArchiveExtractionJob::start() ->
+ArchiveExtractionManager::startExtraction() returns while the job object is
+still alive. The job is destroyed LATER, asynchronously, when the Qt event
+loop delivers the QDeferredDeleteEvent posted by deleteLater().
+
+This is demonstrated empirically with a standalone probe (no KNewStuff code,
+Qt 6.11.2 + KF6CoreAddons only) in PART D:
+
+  MODE "later"   = exact shape of the C4 regression test
+                   (result handler calls job->deleteLater()).
+  RESULT: after start() returned -> jobAlive=1 (job NOT destroyed).
+
+  MODE "qwait"   = QTest::qWait(300), i.e. the mechanism QTRY_VERIFY uses.
+  RESULT: after QTest::qWait(300) -> jobAlive=0 (job destroyed later,
+          asynchronously, by the event loop).
+
+  MODE "delete" / "delete-noread" = synchronous delete job inside the
+                   result handler (the kind of destruction that WOULD be
+                   required to catch the pre-C4 UAF).
+  RESULT: segmentation fault (exit 139) INSIDE Qt/KF6 signal-activation
+          cleanup, before any KNewStuff member state is touched. Synchronous
+          destruction of a job inside its own result handler is not supported
+          by KF6/Qt in this configuration.
+
+WHY
+---
+Qt's QObject::deleteLater() posts a QDeferredDeleteEvent to the object.
+Deferred-delete events are delivered when the event loop processes them
+asynchronously -- not synchronously within the signal handler that called
+deleteLater(). Since ArchiveExtractionManager::startExtraction() runs with
+no event loop active at its level, the deferred delete is not processed
+before startExtraction() returns to ArchiveExtractionJob::start(), and
+ArchiveExtractionJob::start() (post-C4) does not touch d after the call.
+
+WHAT THE C4 REGRESSION TEST PROVES
+----------------------------------
+testSyntheticFailureSynchronousJobDestruction
+(archiveextractionjobtest.cpp:1739-1811):
+
+  - handlerRanDuringStartExtraction == true   -> the KJob::result handler
+    runs SYNCHRONOUSLY inside emitResult(), i.e. inside startExtraction()
+    (before it returns to ArchiveExtractionJob::start()).
+  - job->extractionHandle() != -1             -> the manager assigned the
+    handle via setExtractionHandle() BEFORE result delivery (C4 handle
+    assignment ordering).
+  - jobErrorCode == KJob::UserDefinedError    -> exactly one failure result
+    delivered (spy.count() == 1).
+  - No crash when a result handler schedules destruction during the call.
+
+WHAT THE C4 TEST DOES NOT PROVE
+-------------------------------
+It does NOT prove that the job is destroyed before startExtraction() returns,
+because the handler uses deleteLater() (asynchronous). It also does NOT
+discriminate the pre-C4 bug: with the pre-C4 code
+    d->extractionHandle = manager.startExtraction(...);
+the assignment is safe because the job is still alive at return
+(probe mode "later" touches member state after emitResult() and does not
+crash). Hence the test passes with pre-C4 code as well -- it is not a
+regression test that would have caught the C4 use-after-free.
+
+DISCRIMINATING THE UAF WOULD REQUIRE SYNCHRONOUS DESTRUCTION
+------------------------------------------------------------
+A handler that calls `delete job;` synchronously would destroy the job
+before startExtraction() returns, exposing the pre-C4 `d->extractionHandle =`
+use-after-free. However the probe shows this path crashes inside Qt/KF6
+signal-activation cleanup (exit 139) regardless of KNewStuff code, so such a
+test cannot be written trivially within KF6's current signal semantics.
+
+C4 FIX POSTURE (source cross-reference)
+---------------------------------------
+  src/core/jobs/archiveextractionjob.cpp:77-104  -- ArchiveExtractionJob::start()
+      Post-C4: after ArchiveExtractionManager::instance().startExtraction(...)
+      returns, start() does NOT access d (no d->extractionHandle assignment).
+  src/core/jobs/archiveextractionjob.cpp:221-224  -- setExtractionHandle(int)
+      The manager's assignment is authoritative; called before any result
+      delivery (manager.cpp:176-178).
+  src/core/jobs/archiveextractionmanager.cpp:95-302  -- startExtraction()
+      Sequence: entry created/stored -> destroyed() observation installed ->
+      setExtractionHandle(handle) -> thread start -> (failure path) ...
+      destroy path: delete newThread; state=Done; threadReaped=true;
+      payload removal attempt -> deliverSyntheticFailure() -> return handle.
+  src/core/jobs/archiveextractionmanager.cpp:439-456  -- deliverSyntheticFailure()
+      resultClaimed=true; job->handleExtractionFailed(...) [d->finished=true,
+      emitResult() -> result handler runs synchronously]; resultDisposed=true;
+      cleanupPayloadIfNeeded if jobDead || job.isNull(); tryFinalize().
+  src/core/jobs/archiveextractionmanager.cpp:684-731  -- tryFinalize()
+      Requires resultDisposed && threadReaped. Done branch releases only if
+      !payloadCleanupPending; first-transition branch releases only if
+      (jobDead || job.isNull()) && !payloadCleanupPending.
+
+
+-------------------------------------------------------------------------------
+7.2 : testCompletedEntryReleased SEMANTICS
+-------------------------------------------------------------------------------
+
+Location: archiveextractionjobtest.cpp:1479-1533
+
+Purpose (per the test's own comment): C1 -- verify that completed entries are
+released from the manager even while the job is still alive, using
+testTotalEntryCount() as the oracle (activeExtractionsCount() ignores Done
+entries).
+
+BODY SUMMARY
+------------
+  - waitForAllFinished(5000) + processEvents; assert testTotalEntryCount()==0
+    (clears leftover Done entries from prior tests).
+  - Loop 3x: start a job on a real tar.gz payload; spy.wait(5000);
+    assert !job->error(); handle = job->extractionHandle() != -1;
+    assert testTotalEntryCount()==1            (entry present while job alive)
+    job->deleteLater(); QTRY_VERIFY(jobPtr.isNull());
+    QTRY_VERIFY(testTotalEntryCount()==0);     (entry released)
+    assert !QFileInfo::exists(payloadFile);    (payload removed)
+  - Final: waitForAllFinished(5000); assert testTotalEntryCount()==0.
+
+WHAT IT PROVES
+--------------
+  - While the job is alive and finished, exactly one entry is tracked
+    (testTotalEntryCount()==1 at line 1518).
+  - After job->deleteLater() plus QTRY_VERIFY(jobPtr.isNull()), the entry is
+    released (testTotalEntryCount()==0 at line 1525).
+  - The payload is removed after completion.
+  - Repeated 3x with no accumulation (no entry leak across iterations).
+
+WHAT IT DOES NOT PROVE
+----------------------
+  - It does NOT prove the entry is released while the job is still alive: the
+    zero-entry assertion (line 1525) runs AFTER QTRY_VERIFY(jobPtr.isNull()),
+    i.e. after the job has been destroyed. The release path observed is:
+      job destroyed -> queued destroyed callback sets jobDead ->
+      tryFinalize (Done branch) -> cleanupPayloadIfNeeded -> releaseEntryFromVector.
+  - The pre-loop assertion at line 1490 (testTotalEntryCount()==0 before any
+    new job) only confirms leftovers from prior tests were drained; it is not
+    part of the per-iteration release check.
+
+CONCLUSION
+----------
+The test validates that a finished job's entry is eventually released after
+job destruction, and that the payload is removed. It does not, by itself,
+establish release-before-destruction.
+
+
+-------------------------------------------------------------------------------
+7.3 : VERBATIM SOURCE EXCERPTS FOR CROSS-REFERENCE
+-------------------------------------------------------------------------------
+
+===== ArchiveExtractionJob::start (post-C4)  (archiveextractionjob.cpp:77-104) =====
+ 77: void ArchiveExtractionJob::start()
+ 78: {
+ 79:     if (d->startCalled) {
+ 80:         return;
+ 81:     }
+ 82:     d->startCalled = true;
+ 83: 
+ 84:     // If kill was requested before start, finish immediately with KilledJobError
+ 85:     // and clean up the payload since no worker will be created to handle it.
+ 86:     if (d->killRequested) {
+ 87:         QFile::remove(d->payloadFile);
+ 88:         if (!error()) {
+ 89:             setError(KJob::KilledJobError);
+ 90:             setErrorText(i18n("Archive extraction was cancelled"));
+ 91:             emitResult();
+ 92:         } else if (error() == KJob::KilledJobError && errorText().isEmpty()) {
+ 93:             setErrorText(i18n("Archive extraction was cancelled"));
+ 94:         }
+ 95:         return;
+ 96:     }
+ 97: 
+ 98:     // Start extraction through the manager. The manager assigns the extraction
+ 99:     // handle via setExtractionHandle() before any result delivery. We must not
+100:     // access d after this call returns: a synchronous result handler may have
+101:     // destroyed the job, freeing d.
+102:     ArchiveExtractionManager::instance().startExtraction(
+103:         d->payloadFile, d->installDir, d->uncompressionOption, this);
+104: }
+===== end =====
+===== job-destruction observation block (manager.cpp:132-158)  (archiveextractionmanager.cpp:132-158) =====
+132:     // Install job-destruction observation BEFORE any result delivery.
+133:     // This ensures that even if startExtraction() synchronously emits a
+134:     // result (e.g., synthetic failure), the manager can track job destruction
+135:     // and release the entry once both notifications are complete.
+136:     if (storedEntry->job) {
+137:         QObject::connect(storedEntry->job, &QObject::destroyed,
+138:                          this, [this, handle]() {
+139:             QMetaObject::invokeMethod(this, [this, handle]() {
+140:                 std::shared_ptr<ExtractionEntry> e;
+141:                 {
+142:                     QMutexLocker locker(&m_entriesMutex);
+143:                     if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+144:                         e = m_entries[handle];
+145:                     }
+146:                 }
+147:                 if (!e) {
+148:                     return;
+149:                 }
+150:                 e->jobDead.store(true, std::memory_order_release);
+151:                 if (e->resultDisposed.load(std::memory_order_acquire)
+152:                     && e->threadReaped.load(std::memory_order_acquire)) {
+153:                     cleanupPayloadIfNeeded(e);
+154:                 }
+155:                 tryFinalize(e);
+156:             }, Qt::QueuedConnection);
+157:         }, Qt::DirectConnection);
+158:     }
+===== end =====
+===== startExtraction: handle assignment + failed-start path (manager.cpp:160-222)  (archiveextractionmanager.cpp:160-222) =====
+160:     // Set the extraction handle on the job BEFORE any result delivery.
+161:     // If startExtraction() synchronously emits a result (e.g., synthetic
+162:     // failure) and the result handler destroys the job, the job destructor
+163:     // will see d->finished == true (set before emitResult in handleExtractionFailed)
+164:     // and will skip requestCancellation, leaving entry finalization to
+165:     // deliverSyntheticFailure -> tryFinalize, which is already in progress.
+166:     // The job-destruction connection installed above ensures the manager
+167:     // observes job destruction and releases the entry.
+168:     // Set the extraction handle on the job BEFORE any result delivery.
+169:     // If startExtraction() synchronously emits a result (e.g., synthetic
+170:     // failure) and the result handler destroys the job, the job will have a
+171:     // valid handle. The job destructor checks d->finished (set before
+172:     // emitResult in handleExtractionFailed) and skips requestCancellation,
+173:     // leaving entry finalization to deliverSyntheticFailure -> tryFinalize.
+174:     // The job-destruction connection installed above ensures the manager
+175:     // observes job destruction and releases the entry.
+176:     if (storedEntry->job) {
+177:         storedEntry->job->setExtractionHandle(handle);
+178:     }
+179: 
+180:     // Corrected startup sequence: start the thread BEFORE creating/moving the worker.
+181:     // This avoids moving a worker into a thread whose native creation failed.
+182:     QThread *newThread = new QThread();
+183:     entry->thread = newThread;
+184: 
+185:     bool started = false;
+186:     if (m_testForceStartFailure) {
+187:         // Deterministic test seam: simulate a failed native thread start.
+188:         started = false;
+189:     } else {
+190:         newThread->start();
+191:         started = newThread->isRunning();
+192:     }
+193: 
+194:     if (!started) {
+195:         // Failed-start path: no worker was ever created or moved, so no consumer
+196:         // can claim the payload. Clean it up directly, finalize the entry, and
+197:         // report a synthetic terminal extraction failure.
+198:         delete newThread;
+199:         entry->thread = nullptr;
+200:         entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+201:         entry->threadReaped.store(true, std::memory_order_release);
+202: 
+203:         if (!entry->payloadFile.isEmpty() && QFileInfo::exists(entry->payloadFile)) {
+204:             // Test-only: simulate payload removal failure to exercise the retry path.
+205:             if (m_testPayloadRemoveFailure) {
+206:                 entry->payloadCleanupPending.store(true, std::memory_order_release);
+207:                 schedulePayloadCleanupRetry(entry->handle);
+208:                 qCWarning(KNEWSTUFFCORE) << "Payload removal (simulated failure)"
+209:                                          << entry->payloadFile << "after thread start failure; will retry";
+210:             } else if (!QFile::remove(entry->payloadFile)) {
+211:                 // Payload removal failed. Retry later; do not release the entry
+212:                 // until the payload is confirmed removed.
+213:                 entry->payloadCleanupPending.store(true, std::memory_order_release);
+214:                 schedulePayloadCleanupRetry(entry->handle);
+215:                 qCWarning(KNEWSTUFFCORE) << "Failed to remove payload" << entry->payloadFile
+216:                                          << "after thread start failure; will retry";
+217:             }
+218:         }
+219: 
+220:         deliverSyntheticFailure(entry, QStringLiteral("Archive extraction thread could not be started"));
+221:         return handle;
+222:     }
+===== end =====
+===== deliverSyntheticFailure (manager.cpp:439-456)  (archiveextractionmanager.cpp:439-456) =====
+439: void ArchiveExtractionManager::deliverSyntheticFailure(std::shared_ptr<ExtractionEntry> entry,
+440:                                                        const QString &errorMessage)
+441: {
+442:     // Synthetic terminal failure for a thread that failed to start.
+443:     // No worker was ever created/moved, so no worker result exists; report failure directly.
+444:     QPointer<ArchiveExtractionJob> job = entry->job;
+445:     entry->resultClaimed.store(true, std::memory_order_release);
+446: 
+447:     if (job) {
+448:         entry->job->handleExtractionFailed(errorMessage);
+449:     }
+450: 
+451:     entry->resultDisposed.store(true, std::memory_order_release);
+452:     if (entry->jobDead.load(std::memory_order_acquire) || entry->job.isNull()) {
+453:         cleanupPayloadIfNeeded(entry);
+454:     }
+455:     tryFinalize(entry);
+456: }
+===== end =====
+===== tryFinalize (manager.cpp:684-731)  (archiveextractionmanager.cpp:684-731) =====
+684: bool ArchiveExtractionManager::tryFinalize(std::shared_ptr<ExtractionEntry> entry)
+685: {
+686:     if (!entry) {
+687:         return false;
+688:     }
+689: 
+690:     // Finalization invariant: both result delivery and physical reaping must be complete.
+691:     if (!entry->resultDisposed.load(std::memory_order_acquire)
+692:         || !entry->threadReaped.load(std::memory_order_acquire)) {
+693:         return false;
+694:     }
+695: 
+696:     if (entry->state.load(std::memory_order_acquire) == ExtractionEntry::State::Done) {
+697:         // Already marked Done. Clean up payload if job is dead, then release entry
+698:         // only if payload cleanup is not pending.
+699:         if (entry->jobDead.load(std::memory_order_acquire)
+700:             || entry->job.isNull()) {
+701:             cleanupPayloadIfNeeded(entry);
+702:         }
+703:         if (!entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+704:             releaseEntryFromVector(entry);
+705:         }
+706:         return true;
+707:     }
+708: 
+709:     // Clean up any unconsumed payload only if the job is dead (no live consumer).
+710:     // A live fallback handler may still consume/rename the payload; the manager
+711:     // must not remove it before that handler has returned.
+712:     if (entry->jobDead.load(std::memory_order_acquire)
+713:         || entry->job.isNull()) {
+714:         cleanupPayloadIfNeeded(entry);
+715:     }
+716: 
+717:     entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+718: 
+719:     // Do NOT remove from vector yet if the job is still alive — the job's
+720:     // destroyed signal callback will call tryFinalize again (Done branch),
+721:     // which will set jobDead, clean up payload, and release the entry.
+722:     // Also do NOT remove if payload cleanup is pending (removal failed); the
+723:     // payload cleanup retry will call tryFinalize again once the payload is gone.
+724:     if ((entry->jobDead.load(std::memory_order_acquire)
+725:          || entry->job.isNull())
+726:         && !entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+727:         releaseEntryFromVector(entry);
+728:     }
+729: 
+730:     return true;
+731: }
+===== end =====
+
+-------------------------------------------------------------------------------
+PART D : STANDALONE PROBE SOURCE (VERBATIM)  /tmp/kilo/c4_order_probe.cpp
+-------------------------------------------------------------------------------
+
+===== standalone C4-ordering probe (no KNewStuff code)  (c4_order_probe.cpp:1-124) =====
+  1: // Empirical probe for the C4 ordering question:
+  2: // "Is the job actually destroyed before startExtraction() returns?"
+  3: //
+  4: // This probe does NOT use KNewStuff sources; it reproduces the exact shape of
+  5: // the C4 synthetic-failure path using KF6 KJob only:
+  6: //   manager->startExtraction()  -->  job->handleExtractionFailed()  -->  emitResult()
+  7: //   -->  KJob::result emitted synchronously -->  user handler runs
+  8: //
+  9: // Modes:
+ 10: //   later  - handler calls job->deleteLater()   (what the C4 regression test does)
+ 11: //   delete - handler calls delete job            (true synchronous destruction)
+ 12: //   auto   - default autoDelete(true), no handler action
+ 13: //
+ 14: // It reports whether the job object is still alive (QPointer non-null) right
+ 15: // after the call that emitted the result returns.
+ 16: 
+ 17: #include <KJob>
+ 18: #include <QCoreApplication>
+ 19: #include <QPointer>
+ 20: #include <QEventLoop>
+ 21: #include <QTimer>
+ 22: #include <QElapsedTimer>
+ 23: #include <QTest>
+ 24: #include <cstdio>
+ 25: #include <cstring>
+ 26: 
+ 27: extern const char *g_mode;
+ 28: 
+ 29: class ProbeJob : public KJob
+ 30: {
+ 31: public:
+ 32:     explicit ProbeJob(QObject *parent = nullptr)
+ 33:         : KJob(parent)
+ 34:     {
+ 35:     }
+ 36: 
+ 37:     void start() override
+ 38:     {
+ 39:         // Mimic ArchiveExtractionJob::handleExtractionFailed(): sets error then emits.
+ 40:         setError(KJob::UserDefinedError);
+ 41:         setErrorText(QStringLiteral("synthetic failure"));
+ 42:         emitResult();
+ 43:         // Mimic the PRE-C4 code in ArchiveExtractionJob::start():
+ 44:         //     d->extractionHandle = manager.startExtraction(...);
+ 45:         // i.e. touch member state AFTER the result-emitting call returns.
+ 46:         if (!strcmp(g_mode, "delete-noread")) {
+ 47:             // POST-C4 pattern: do not touch member state after the call.
+ 48:             printf("  [probe] returned from emitResult() WITHOUT touching member state (post-C4 pattern)\n");
+ 49:             return;
+ 50:         }
+ 51:         m_touchedAfterEmit = true;
+ 52:         printf("  [probe] member state touched after emitResult() returned (pre-C4 pattern)\n");
+ 53:     }
+ 54: 
+ 55:     bool m_touchedAfterEmit = false;
+ 56: };
+ 57: 
+ 58: const char *g_mode = "later";
+ 59: 
+ 60: int main(int argc, char **argv)
+ 61: {
+ 62:     QCoreApplication app(argc, argv);
+ 63:     const char *mode = argc > 1 ? argv[1] : "later";
+ 64:     g_mode = mode;
+ 65: 
+ 66:     printf("mode=%s\n", mode);
+ 67: 
+ 68:     ProbeJob *job = new ProbeJob(nullptr);
+ 69:     job->setAutoDelete(strcmp(mode, "auto") != 0); // "auto" keeps the KF6 default (true)
+ 70: 
+ 71:     QPointer<ProbeJob> ptr(job);
+ 72:     bool handlerRan = false;
+ 73: 
+ 74:     QObject::connect(job, &KJob::result, job, [mode, &handlerRan, &ptr](KJob *finishedJob) {
+ 75:         handlerRan = true;
+ 76:         printf("  [probe] result handler entered; job=%p alive=%d\n",
+ 77:                static_cast<void *>(finishedJob), ptr.isNull() ? 0 : 1);
+ 78:         if (strcmp(mode, "later") == 0) {
+ 79:             finishedJob->deleteLater();
+ 80:             printf("  [probe] handler called deleteLater(); job alive right after deleteLater()=%d\n",
+ 81:                    ptr.isNull() ? 0 : 1);
+ 82:         } else if (strcmp(mode, "delete") == 0 || strcmp(mode, "delete-noread") == 0) {
+ 83:             printf("  [probe] handler calling delete job (synchronous destruction)\n");
+ 84:             delete finishedJob;
+ 85:             printf("  [probe] handler returned; job alive=%d\n", ptr.isNull() ? 0 : 1);
+ 86:         }
+ 87:     });
+ 88: 
+ 89:     job->start();
+ 90: 
+ 91:     printf("RESULT after start() returned: handlerRan=%d jobAlive=%d\n",
+ 92:            handlerRan ? 1 : 0, ptr.isNull() ? 0 : 1);
+ 93: 
+ 94:     QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+ 95:     printf("RESULT after processEvents(): jobAlive=%d\n", ptr.isNull() ? 0 : 1);
+ 96: 
+ 97:     if (strcmp(mode, "later") == 0) {
+ 98:         // QTest's QTRY_VERIFY/qWait spin the event loop with
+ 99:         // QCoreApplication::processEvents() (no nested QEventLoop::exec()),
+100:         // which keeps the event-loop level at 0 and therefore lets Qt deliver
+101:         // the deferred-delete event. Reproduce that here.
+102:         QElapsedTimer timer;
+103:         timer.start();
+104:         while (ptr && timer.elapsed() < 500) {
+105:             QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+106:         }
+107:         printf("RESULT after QTRY_VERIFY-like processEvents spin: jobAlive=%d\n",
+108:                ptr.isNull() ? 0 : 1);
+109:     }
+110: 
+111:     if (strcmp(mode, "qwait") == 0) {
+112:         // Same mechanism the real KNewStuff regression test uses
+113:         // (QTRY_VERIFY -> QTest::qWait), reproduced with the real QtTest API.
+114:         QTest::qWait(300);
+115:         printf("RESULT after QTest::qWait(300): jobAlive=%d\n", ptr.isNull() ? 0 : 1);
+116:     }
+117: 
+118:     if (ptr.isNull()) {
+119:         printf("CONCLUSION: job was destroyed\n");
+120:     } else {
+121:         printf("CONCLUSION: job was NOT destroyed\n");
+122:     }
+123:     return 0;
+124: }
+===== end =====
+
+-------------------------------------------------------------------------------
+PART E : PROBE EXECUTION OUTPUTS (VERBATIM)
+-------------------------------------------------------------------------------
+
+===== PROBE OUTPUT [later] (verbatim) =====
+mode=later
+  [probe] result handler entered; job=0x306eae90 alive=1
+  [probe] handler called deleteLater(); job alive right after deleteLater()=1
+  [probe] member state touched after emitResult() returned (pre-C4 pattern)
+RESULT after start() returned: handlerRan=1 jobAlive=1
+RESULT after processEvents(): jobAlive=1
+RESULT after QTRY_VERIFY-like processEvents spin: jobAlive=1
+CONCLUSION: job was NOT destroyed
+===== end probe [later] =====
+
+===== PROBE OUTPUT [qwait] (verbatim) =====
+mode=qwait
+  [probe] result handler entered; job=0x14ac2e90 alive=1
+  [probe] member state touched after emitResult() returned (pre-C4 pattern)
+RESULT after start() returned: handlerRan=1 jobAlive=1
+RESULT after processEvents(): jobAlive=1
+RESULT after QTest::qWait(300): jobAlive=0
+CONCLUSION: job was destroyed
+===== end probe [qwait] =====
+
+===== PROBE OUTPUT [auto] (verbatim) =====
+mode=auto
+  [probe] result handler entered; job=0x3adcbe90 alive=1
+  [probe] member state touched after emitResult() returned (pre-C4 pattern)
+RESULT after start() returned: handlerRan=1 jobAlive=1
+RESULT after processEvents(): jobAlive=1
+CONCLUSION: job was NOT destroyed
+===== end probe [auto] =====
+
+===== PROBE OUTPUT [delete] (verbatim) =====
+mode=delete
+  [probe] result handler entered; job=0x1ed75e90 alive=1
+  [probe] handler calling delete job (synchronous destruction)
+  [probe] handler returned; job alive=0
+===== end probe [delete] =====
+
+===== PROBE OUTPUT [deletenoread] (verbatim) =====
+mode=delete-noread
+  [probe] result handler entered; job=0x1a5a0e90 alive=1
+  [probe] handler calling delete job (synchronous destruction)
+  [probe] handler returned; job alive=0
+===== end probe [deletenoread] =====
+
+
+-------------------------------------------------------------------------------
+END OF REVIEW BUNDLE 7
+-------------------------------------------------------------------------------
+

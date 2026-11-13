@@ -1,0 +1,73 @@
+********* Start testing of InstallationTest *********
+Config: Using QtTest library 6.11.2, Qt 6.11.2 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.2.1 20260819 (Red Hat 16.2.1-2)), fedora 44
+PASS   : InstallationTest::initTestCase()
+PASS   : InstallationTest::testConfigFileReading()
+QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: Install: "testInstallCommand" from "/tmp/CsWaDg-testfile.txt"
+QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/testfile.txt" to "/home/prakhar/.qttest/share/demo/testfile.txt"
+PASS   : InstallationTest::testInstallCommand()
+QWARN  : InstallationTest::testInstallCommandArchive() kf.newstuff.core: Install: "" from "/tmp/CXAkJi-archive_dir.tar.gz"
+PASS   : InstallationTest::testInstallCommandArchive()
+QWARN  : InstallationTest::testInstallCommandTopLevelFilesInArchive() kf.newstuff.core: Install: "" from "/tmp/NdemEg-archive_toplevel_files.tar.gz"
+PASS   : InstallationTest::testInstallCommandTopLevelFilesInArchive()
+PASS   : InstallationTest::testUninstallCommand()
+PASS   : InstallationTest::testUninstallCommandDirectory()
+PASS   : InstallationTest::testCopyError()
+QWARN  : InstallationTest::testAsyncArchiveExtraction() kf.newstuff.core: Install: "" from "/tmp/dEyLuU-archive_dir.tar.gz"
+PASS   : InstallationTest::testAsyncArchiveExtraction()
+QWARN  : InstallationTest::testAsyncArchiveExtractionTopLevelFiles() kf.newstuff.core: Install: "" from "/tmp/ENMrXp-archive_toplevel_files.tar.gz"
+PASS   : InstallationTest::testAsyncArchiveExtractionTopLevelFiles()
+QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: Install: "testNonArchive" from "/tmp/WhtJIt-installationtest.RomWAG"
+QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.RomWAG" to "/home/prakhar/.qttest/share/demo/installationtest.RomWAG"
+PASS   : InstallationTest::testNonArchiveFallback()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Install: "" from "/tmp/ZtuEZV-corrupt_sDoNaq.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Archive extraction failed: "Archive /tmp/ZtuEZV-corrupt_sDoNaq.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpen()
+QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/LoOFyY-installationtest.CWpaOv"
+QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/LoOFyY-installationtest.CWpaOv"
+PASS   : InstallationTest::testUnknownMimeUncompressIntoSubdir()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/DUppJC-corrupt_cTiDrq.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/DUppJC-corrupt_cTiDrq.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/lgqkeW-corrupt_PUqDmr.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/lgqkeW-corrupt_PUqDmr.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/kPISHh-corrupt_zBWxkv.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/kPISHh-corrupt_zBWxkv.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+QWARN  : InstallationTest::testGuiResponsivenessDuringExtraction() kf.newstuff.core: Install: "" from "/tmp/zJqssM-archive_dir.tar.gz"
+PASS   : InstallationTest::testGuiResponsivenessDuringExtraction()
+PASS   : InstallationTest::testCancellationDuringExtraction()
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/Zmdtzc-installationtest.QrRSVo"
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.QrRSVo" to "/home/prakhar/.qttest/share/demo/installationtest.QrRSVo"
+PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive()
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/Rrkxlt-installationtest.SJkGNr"
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.SJkGNr" to "/home/prakhar/.qttest/share/demo/installationtest.SJkGNr"
+PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive()
+QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/kjiLsm-installationtest.aNlnjm"
+QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/kjiLsm-installationtest.aNlnjm"
+PASS   : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir()
+PASS   : InstallationTest::testCancellationBeforeStart()
+QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/ySrjGK-installationtest.ngEIFv"
+QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.ngEIFv" to "/home/prakhar/.qttest/share/demo/installationtest.ngEIFv"
+PASS   : InstallationTest::testWallpaperNonArchiveSubdir()
+QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: Install: "" from "/tmp/UeOTaz-installationtest.rTeWTO"
+QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.rTeWTO" to "/home/prakhar/.qttest/share/demo/installationtest.rTeWTO"
+PASS   : InstallationTest::testWallpaperNonArchiveAlways()
+QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/VaMtsR-corrupt_wallpaper_nUrPKn.tar.gz"
+QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/VaMtsR-corrupt_wallpaper_nUrPKn.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testWallpaperCorruptArchiveSubdir()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Install: "" from "/tmp/jHSoIb-invalid_aLJgDs.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/jHSoIb-invalid_aLJgDs.zip. The reported error was: Not a ZIP file, no Local File Header found."
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZip()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/ENUzWi-invalid_taGQAJ.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/ENUzWi-invalid_taGQAJ.zip. The reported error was: Not a ZIP file, no Local File Header found."
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/IEghUd-invalid_ERBVFG.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_ERBVFG.zip" to "/home/prakhar/.qttest/share/demo/invalid_ERBVFG.zip"
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/sQPQCW-invalid_GprnUk.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_GprnUk.zip" to "/home/prakhar/.qttest/share/demo/invalid_GprnUk.zip"
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive()
+PASS   : InstallationTest::cleanupTestCase()
+Totals: 30 passed, 0 failed, 0 skipped, 0 blacklisted, 2687ms
+********* Finished testing of InstallationTest *********

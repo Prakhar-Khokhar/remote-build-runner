@@ -1,0 +1,8 @@
+mode=later
+  [probe] result handler entered; job=0x306eae90 alive=1
+  [probe] handler called deleteLater(); job alive right after deleteLater()=1
+  [probe] member state touched after emitResult() returned (pre-C4 pattern)
+RESULT after start() returned: handlerRan=1 jobAlive=1
+RESULT after processEvents(): jobAlive=1
+RESULT after QTRY_VERIFY-like processEvents spin: jobAlive=1
+CONCLUSION: job was NOT destroyed

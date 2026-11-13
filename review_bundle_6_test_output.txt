@@ -1,0 +1,342 @@
+===============================================================================
+REVIEW BUNDLE 6 of 7 - EXACT TEST EXECUTION OUTPUT, PER-TEST COUNTS, EXIT CODES
+===============================================================================
+Generated (UTC): 2026-11-13 17:53:34 UTC
+Host Qt/KF6    : Qt 6.11.2, KF6 6.32.0, GCC 16.2.1, Fedora 44 (x86_64)
+Binary         : build/bin/archiveextractionjobtest, build/bin/installationtest
+Working dir    : build/autotests/core (as configured by CTestTestfile.cmake)
+
+IMPORTANT BUILD-ARTIFACT QUIRK:
+  The installation test MOVES build/autotests/core/data/testfile.txt out of the
+  build data directory while it runs, so the file is missing afterwards. Before
+  every run it was restored with:
+    cp -p autotests/core/data/testfile.txt build/autotests/core/data/testfile.txt
+  Only the build tree was touched; no tracked source file was modified.
+
+-------------------------------------------------------------------------------
+SECTION A: direct execution of build/bin/archiveextractionjobtest
+  command: (cd build/autotests/core && ../../../build/bin/archiveextractionjobtest)
+  exit code: 0
+-------------------------------------------------------------------------------
+
+********* Start testing of ArchiveExtractionJobTest *********
+Config: Using QtTest library 6.11.2, Qt 6.11.2 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.2.1 20260819 (Red Hat 16.2.1-2)), fedora 44
+PASS   : ArchiveExtractionJobTest::initTestCase()
+PASS   : ArchiveExtractionJobTest::testSuccessfulExtraction()
+QWARN  : ArchiveExtractionJobTest::testSuccessfulExtractionTopLevelFiles() kf.archive: Attempted export into folder "/home/prakhar/.qttest/share/demo/" which is outside of the extraction root folder "/home/prakhar/.qttest/share/demo/" . Changing export of contained files to extraction root folder.
+PASS   : ArchiveExtractionJobTest::testSuccessfulExtractionTopLevelFiles()
+PASS   : ArchiveExtractionJobTest::testCorruptArchiveAlwaysUncompress()
+PASS   : ArchiveExtractionJobTest::testCorruptArchiveWithFallback()
+PASS   : ArchiveExtractionJobTest::testNonArchiveFile()
+PASS   : ArchiveExtractionJobTest::testUnknownMimeUncompressIntoSubdir()
+PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+PASS   : ArchiveExtractionJobTest::testCancellationBeforeStart()
+PASS   : ArchiveExtractionJobTest::testCancellationAfterWorkerCreationBeforeExecution()
+PASS   : ArchiveExtractionJobTest::testCancellationBeforeCopyTo()
+PASS   : ArchiveExtractionJobTest::testCancellationBeforeCancellationCheck()
+PASS   : ArchiveExtractionJobTest::testJobDestructionWhileWorkerBlockedAtPreCopyToBarrier()
+PASS   : ArchiveExtractionJobTest::testGuiResponsivenessDuringExtraction()
+PASS   : ArchiveExtractionJobTest::testKillAfterCompletionNoOp()
+PASS   : ArchiveExtractionJobTest::testFallbackPayloadCleanupOnCancellation()
+PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+PASS   : ArchiveExtractionJobTest::testUnknownMimeAlwaysUncompressError()
+PASS   : ArchiveExtractionJobTest::testDestructionBeforeThreadStart()
+PASS   : ArchiveExtractionJobTest::testDestructionAfterThreadStartBeforeWorkerExecution()
+PASS   : ArchiveExtractionJobTest::testCancellationWhileWorkerBlockedAtStartup()
+PASS   : ArchiveExtractionJobTest::testManagerMediatedCancellation()
+PASS   : ArchiveExtractionJobTest::testThreadCreationFailure()
+PASS   : ArchiveExtractionJobTest::testDeadJobFallbackPayloadCleanup()
+PASS   : ArchiveExtractionJobTest::testMultipleConcurrentJobs()
+PASS   : ArchiveExtractionJobTest::testCompletedEntryReleased()
+PASS   : ArchiveExtractionJobTest::testStartupFailurePayloadAndEntryCleanup()
+QWARN  : ArchiveExtractionJobTest::testStartupFailurePayloadRemoveFailureRetry() kf.newstuff.core: Payload removal (simulated failure) "/tmp/startup_fail_retry_ofKLWD" after thread start failure; will retry
+PASS   : ArchiveExtractionJobTest::testStartupFailurePayloadRemoveFailureRetry()
+PASS   : ArchiveExtractionJobTest::testJobDestructionBeforeResultDelivery()
+PASS   : ArchiveExtractionJobTest::testJobDestructionAfterResultDelivery()
+PASS   : ArchiveExtractionJobTest::testSyntheticFailureSynchronousJobDestruction()
+PASS   : ArchiveExtractionJobTest::cleanupTestCase()
+Totals: 33 passed, 0 failed, 0 skipped, 0 blacklisted, 939ms
+********* Finished testing of ArchiveExtractionJobTest *********
+
+  [per-test summary extracted from the QtTest output above]
+  Totals: 33 passed, 0 failed, 0 skipped, 0 blacklisted, 939ms
+  Test functions executed: 31 test functions + initTestCase + cleanupTestCase = 33 PASS lines
+  Exit code: 0
+
+-------------------------------------------------------------------------------
+SECTION B: direct execution of build/bin/installationtest
+  command: (cd build/autotests/core && ../../../build/bin/installationtest)
+  exit code: 0
+-------------------------------------------------------------------------------
+
+********* Start testing of InstallationTest *********
+Config: Using QtTest library 6.11.2, Qt 6.11.2 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.2.1 20260819 (Red Hat 16.2.1-2)), fedora 44
+PASS   : InstallationTest::initTestCase()
+PASS   : InstallationTest::testConfigFileReading()
+QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: Install: "testInstallCommand" from "/tmp/CsWaDg-testfile.txt"
+QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/testfile.txt" to "/home/prakhar/.qttest/share/demo/testfile.txt"
+PASS   : InstallationTest::testInstallCommand()
+QWARN  : InstallationTest::testInstallCommandArchive() kf.newstuff.core: Install: "" from "/tmp/CXAkJi-archive_dir.tar.gz"
+PASS   : InstallationTest::testInstallCommandArchive()
+QWARN  : InstallationTest::testInstallCommandTopLevelFilesInArchive() kf.newstuff.core: Install: "" from "/tmp/NdemEg-archive_toplevel_files.tar.gz"
+PASS   : InstallationTest::testInstallCommandTopLevelFilesInArchive()
+PASS   : InstallationTest::testUninstallCommand()
+PASS   : InstallationTest::testUninstallCommandDirectory()
+PASS   : InstallationTest::testCopyError()
+QWARN  : InstallationTest::testAsyncArchiveExtraction() kf.newstuff.core: Install: "" from "/tmp/dEyLuU-archive_dir.tar.gz"
+PASS   : InstallationTest::testAsyncArchiveExtraction()
+QWARN  : InstallationTest::testAsyncArchiveExtractionTopLevelFiles() kf.newstuff.core: Install: "" from "/tmp/ENMrXp-archive_toplevel_files.tar.gz"
+PASS   : InstallationTest::testAsyncArchiveExtractionTopLevelFiles()
+QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: Install: "testNonArchive" from "/tmp/WhtJIt-installationtest.RomWAG"
+QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.RomWAG" to "/home/prakhar/.qttest/share/demo/installationtest.RomWAG"
+PASS   : InstallationTest::testNonArchiveFallback()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Install: "" from "/tmp/ZtuEZV-corrupt_sDoNaq.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Archive extraction failed: "Archive /tmp/ZtuEZV-corrupt_sDoNaq.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpen()
+QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/LoOFyY-installationtest.CWpaOv"
+QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/LoOFyY-installationtest.CWpaOv"
+PASS   : InstallationTest::testUnknownMimeUncompressIntoSubdir()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/DUppJC-corrupt_cTiDrq.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/DUppJC-corrupt_cTiDrq.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/lgqkeW-corrupt_PUqDmr.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/lgqkeW-corrupt_PUqDmr.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/kPISHh-corrupt_zBWxkv.tar.gz"
+QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/kPISHh-corrupt_zBWxkv.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+QWARN  : InstallationTest::testGuiResponsivenessDuringExtraction() kf.newstuff.core: Install: "" from "/tmp/zJqssM-archive_dir.tar.gz"
+PASS   : InstallationTest::testGuiResponsivenessDuringExtraction()
+PASS   : InstallationTest::testCancellationDuringExtraction()
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/Zmdtzc-installationtest.QrRSVo"
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.QrRSVo" to "/home/prakhar/.qttest/share/demo/installationtest.QrRSVo"
+PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive()
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/Rrkxlt-installationtest.SJkGNr"
+QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.SJkGNr" to "/home/prakhar/.qttest/share/demo/installationtest.SJkGNr"
+PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive()
+QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/kjiLsm-installationtest.aNlnjm"
+QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/kjiLsm-installationtest.aNlnjm"
+PASS   : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir()
+PASS   : InstallationTest::testCancellationBeforeStart()
+QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/ySrjGK-installationtest.ngEIFv"
+QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.ngEIFv" to "/home/prakhar/.qttest/share/demo/installationtest.ngEIFv"
+PASS   : InstallationTest::testWallpaperNonArchiveSubdir()
+QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: Install: "" from "/tmp/UeOTaz-installationtest.rTeWTO"
+QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.rTeWTO" to "/home/prakhar/.qttest/share/demo/installationtest.rTeWTO"
+PASS   : InstallationTest::testWallpaperNonArchiveAlways()
+QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/VaMtsR-corrupt_wallpaper_nUrPKn.tar.gz"
+QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/VaMtsR-corrupt_wallpaper_nUrPKn.tar.gz is empty or corrupt"
+PASS   : InstallationTest::testWallpaperCorruptArchiveSubdir()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Install: "" from "/tmp/jHSoIb-invalid_aLJgDs.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/jHSoIb-invalid_aLJgDs.zip. The reported error was: Not a ZIP file, no Local File Header found."
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZip()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/ENUzWi-invalid_taGQAJ.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/ENUzWi-invalid_taGQAJ.zip. The reported error was: Not a ZIP file, no Local File Header found."
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/IEghUd-invalid_ERBVFG.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_ERBVFG.zip" to "/home/prakhar/.qttest/share/demo/invalid_ERBVFG.zip"
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive()
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/sQPQCW-invalid_GprnUk.zip"
+QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_GprnUk.zip" to "/home/prakhar/.qttest/share/demo/invalid_GprnUk.zip"
+PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive()
+PASS   : InstallationTest::cleanupTestCase()
+Totals: 30 passed, 0 failed, 0 skipped, 0 blacklisted, 2687ms
+********* Finished testing of InstallationTest *********
+
+  [per-test summary extracted from the QtTest output above]
+  Totals: 30 passed, 0 failed, 0 skipped, 0 blacklisted, 2687ms
+  Test functions executed: 28 test functions + initTestCase + cleanupTestCase = 30 PASS lines
+  Exit code: 0
+
+-------------------------------------------------------------------------------
+SECTION C: ctest --test-dir build -j1 -R "knewstuff-(archiveextractionjobtest|installationtest)" --output-on-failure
+  exit code: 0
+-------------------------------------------------------------------------------
+
+Test project /home/prakhar/Github Projects/knewstuff/build
+    Start 5: knewstuff-installationtest
+1/2 Test #5: knewstuff-installationtest ...........   Passed    2.38 sec
+    Start 6: knewstuff-archiveextractionjobtest
+2/2 Test #6: knewstuff-archiveextractionjobtest ...   Passed    0.56 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   2.99 sec
+CTEST_EXIT_CODE=0
+
+-------------------------------------------------------------------------------
+SECTION D: ctest --test-dir build -j1 -R "knewstuff-(archiveextractionjobtest|installationtest)" -V
+  exit code: 0
+-------------------------------------------------------------------------------
+
+UpdateCTestConfiguration  from :/home/prakhar/Github Projects/knewstuff/build/DartConfiguration.tcl
+Test project /home/prakhar/Github Projects/knewstuff/build
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 5
+    Start 5: knewstuff-installationtest
+
+5: Test command: /home/prakhar/Github\ Projects/knewstuff/build/bin/installationtest
+5: Working Directory: /home/prakhar/Github Projects/knewstuff/build/autotests/core
+5: Environment variables: 
+5:  LANG=C
+5: Test timeout computed to be: 10000000
+5: ********* Start testing of InstallationTest *********
+5: Config: Using QtTest library 6.11.2, Qt 6.11.2 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.2.1 20260819 (Red Hat 16.2.1-2)), fedora 44
+5: PASS   : InstallationTest::initTestCase()
+5: PASS   : InstallationTest::testConfigFileReading()
+5: QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: Install: "testInstallCommand" from "/tmp/IjTVFs-testfile.txt"
+5: QWARN  : InstallationTest::testInstallCommand() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/testfile.txt" to "/home/prakhar/.qttest/share/demo/testfile.txt"
+5: PASS   : InstallationTest::testInstallCommand()
+5: QWARN  : InstallationTest::testInstallCommandArchive() kf.newstuff.core: Install: "" from "/tmp/vupoIH-archive_dir.tar.gz"
+5: PASS   : InstallationTest::testInstallCommandArchive()
+5: QWARN  : InstallationTest::testInstallCommandTopLevelFilesInArchive() kf.newstuff.core: Install: "" from "/tmp/iTzIxy-archive_toplevel_files.tar.gz"
+5: PASS   : InstallationTest::testInstallCommandTopLevelFilesInArchive()
+5: PASS   : InstallationTest::testUninstallCommand()
+5: PASS   : InstallationTest::testUninstallCommandDirectory()
+5: PASS   : InstallationTest::testCopyError()
+5: QWARN  : InstallationTest::testAsyncArchiveExtraction() kf.newstuff.core: Install: "" from "/tmp/aoNPiy-archive_dir.tar.gz"
+5: PASS   : InstallationTest::testAsyncArchiveExtraction()
+5: QWARN  : InstallationTest::testAsyncArchiveExtractionTopLevelFiles() kf.newstuff.core: Install: "" from "/tmp/lcRrWK-archive_toplevel_files.tar.gz"
+5: PASS   : InstallationTest::testAsyncArchiveExtractionTopLevelFiles()
+5: QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: Install: "testNonArchive" from "/tmp/SOprGC-installationtest.EDafCZ"
+5: QWARN  : InstallationTest::testNonArchiveFallback() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.EDafCZ" to "/home/prakhar/.qttest/share/demo/installationtest.EDafCZ"
+5: PASS   : InstallationTest::testNonArchiveFallback()
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Install: "" from "/tmp/RHMUJU-corrupt_UNHwor.tar.gz"
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpen() kf.newstuff.core: Archive extraction failed: "Archive /tmp/RHMUJU-corrupt_UNHwor.tar.gz is empty or corrupt"
+5: PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpen()
+5: QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/IWmezM-installationtest.rufUIM"
+5: QWARN  : InstallationTest::testUnknownMimeUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/IWmezM-installationtest.rufUIM"
+5: PASS   : InstallationTest::testUnknownMimeUncompressIntoSubdir()
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/eINxgU-corrupt_lwCnIp.tar.gz"
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/eINxgU-corrupt_lwCnIp.tar.gz is empty or corrupt"
+5: PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/BYeGIK-corrupt_btCVKv.tar.gz"
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/BYeGIK-corrupt_btCVKv.tar.gz is empty or corrupt"
+5: PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Install: "" from "/tmp/YlKxOm-corrupt_PSUpQc.tar.gz"
+5: QWARN  : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback() kf.newstuff.core: Archive extraction failed: "Archive /tmp/YlKxOm-corrupt_PSUpQc.tar.gz is empty or corrupt"
+5: PASS   : InstallationTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+5: QWARN  : InstallationTest::testGuiResponsivenessDuringExtraction() kf.newstuff.core: Install: "" from "/tmp/MBjPxM-archive_dir.tar.gz"
+5: PASS   : InstallationTest::testGuiResponsivenessDuringExtraction()
+5: PASS   : InstallationTest::testCancellationDuringExtraction()
+5: QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/oClnlp-installationtest.AFDrRK"
+5: QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.AFDrRK" to "/home/prakhar/.qttest/share/demo/installationtest.AFDrRK"
+5: PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIfArchive()
+5: QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/CLSXTZ-installationtest.rAcDXQ"
+5: QWARN  : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.rAcDXQ" to "/home/prakhar/.qttest/share/demo/installationtest.rAcDXQ"
+5: PASS   : InstallationTest::testArchiveExtractionFallbackUncompressIntoSubdirIfArchive()
+5: QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/ACskmD-installationtest.uFpUlL"
+5: QWARN  : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Could not determine the type of archive of the downloaded file /tmp/ACskmD-installationtest.uFpUlL"
+5: PASS   : InstallationTest::testArchiveExtractionNoFallbackUncompressIntoSubdir()
+5: PASS   : InstallationTest::testCancellationBeforeStart()
+5: QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/lXlGQq-installationtest.EKBMEC"
+5: QWARN  : InstallationTest::testWallpaperNonArchiveSubdir() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.EKBMEC" to "/home/prakhar/.qttest/share/demo/installationtest.EKBMEC"
+5: PASS   : InstallationTest::testWallpaperNonArchiveSubdir()
+5: QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: Install: "" from "/tmp/AhjOQO-installationtest.EhDZnB"
+5: QWARN  : InstallationTest::testWallpaperNonArchiveAlways() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/installationtest.EhDZnB" to "/home/prakhar/.qttest/share/demo/installationtest.EhDZnB"
+5: PASS   : InstallationTest::testWallpaperNonArchiveAlways()
+5: QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Install: "" from "/tmp/HXcklJ-corrupt_wallpaper_gFAKgK.tar.gz"
+5: QWARN  : InstallationTest::testWallpaperCorruptArchiveSubdir() kf.newstuff.core: Archive extraction failed: "Archive /tmp/HXcklJ-corrupt_wallpaper_gFAKgK.tar.gz is empty or corrupt"
+5: PASS   : InstallationTest::testWallpaperCorruptArchiveSubdir()
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Install: "" from "/tmp/LqCyNA-invalid_KgZblB.zip"
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZip() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/LqCyNA-invalid_KgZblB.zip. The reported error was: Not a ZIP file, no Local File Header found."
+5: PASS   : InstallationTest::testGenuineArchiveOpenFailureZip()
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Install: "" from "/tmp/bMEkTZ-invalid_cAeYNG.zip"
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir() kf.newstuff.core: Archive extraction failed: "Failed to open the archive file /tmp/bMEkTZ-invalid_cAeYNG.zip. The reported error was: Not a ZIP file, no Local File Header found."
+5: PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdir()
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: Install: "" from "/tmp/PrPRgY-invalid_uDCVjV.zip"
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_uDCVjV.zip" to "/home/prakhar/.qttest/share/demo/invalid_uDCVjV.zip"
+5: PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIfArchive()
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: Install: "" from "/tmp/QZmnfT-invalid_cdeptP.zip"
+5: QWARN  : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive() kf.newstuff.core: move: "/home/prakhar/.qttest/share/demo/invalid_cdeptP.zip" to "/home/prakhar/.qttest/share/demo/invalid_cdeptP.zip"
+5: PASS   : InstallationTest::testGenuineArchiveOpenFailureZipUncompressIntoSubdirIfArchive()
+5: PASS   : InstallationTest::cleanupTestCase()
+5: Totals: 30 passed, 0 failed, 0 skipped, 0 blacklisted, 3252ms
+5: ********* Finished testing of InstallationTest *********
+1/2 Test #5: knewstuff-installationtest ...........   Passed    3.40 sec
+test 6
+    Start 6: knewstuff-archiveextractionjobtest
+
+6: Test command: /home/prakhar/Github\ Projects/knewstuff/build/bin/archiveextractionjobtest
+6: Working Directory: /home/prakhar/Github Projects/knewstuff/build/autotests/core
+6: Environment variables: 
+6:  QT_PLUGIN_PATH=/home/prakhar/Github Projects/knewstuff/build/bin
+6: Test timeout computed to be: 120
+6: ********* Start testing of ArchiveExtractionJobTest *********
+6: Config: Using QtTest library 6.11.2, Qt 6.11.2 (x86_64-little_endian-lp64 shared (dynamic) release build; by GCC 16.2.1 20260819 (Red Hat 16.2.1-2)), fedora 44
+6: PASS   : ArchiveExtractionJobTest::initTestCase()
+6: PASS   : ArchiveExtractionJobTest::testSuccessfulExtraction()
+6: QWARN  : ArchiveExtractionJobTest::testSuccessfulExtractionTopLevelFiles() kf.archive: Attempted export into folder "/home/prakhar/.qttest/share/demo/" which is outside of the extraction root folder "/home/prakhar/.qttest/share/demo/" . Changing export of contained files to extraction root folder.
+6: PASS   : ArchiveExtractionJobTest::testSuccessfulExtractionTopLevelFiles()
+6: PASS   : ArchiveExtractionJobTest::testCorruptArchiveAlwaysUncompress()
+6: PASS   : ArchiveExtractionJobTest::testCorruptArchiveWithFallback()
+6: PASS   : ArchiveExtractionJobTest::testNonArchiveFile()
+6: PASS   : ArchiveExtractionJobTest::testUnknownMimeUncompressIntoSubdir()
+6: PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+6: PASS   : ArchiveExtractionJobTest::testCancellationBeforeStart()
+6: PASS   : ArchiveExtractionJobTest::testCancellationAfterWorkerCreationBeforeExecution()
+6: PASS   : ArchiveExtractionJobTest::testCancellationBeforeCopyTo()
+6: PASS   : ArchiveExtractionJobTest::testCancellationBeforeCancellationCheck()
+6: PASS   : ArchiveExtractionJobTest::testJobDestructionWhileWorkerBlockedAtPreCopyToBarrier()
+6: PASS   : ArchiveExtractionJobTest::testGuiResponsivenessDuringExtraction()
+6: PASS   : ArchiveExtractionJobTest::testKillAfterCompletionNoOp()
+6: PASS   : ArchiveExtractionJobTest::testFallbackPayloadCleanupOnCancellation()
+6: PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+6: PASS   : ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+6: PASS   : ArchiveExtractionJobTest::testUnknownMimeAlwaysUncompressError()
+6: PASS   : ArchiveExtractionJobTest::testDestructionBeforeThreadStart()
+6: PASS   : ArchiveExtractionJobTest::testDestructionAfterThreadStartBeforeWorkerExecution()
+6: PASS   : ArchiveExtractionJobTest::testCancellationWhileWorkerBlockedAtStartup()
+6: PASS   : ArchiveExtractionJobTest::testManagerMediatedCancellation()
+6: PASS   : ArchiveExtractionJobTest::testThreadCreationFailure()
+6: PASS   : ArchiveExtractionJobTest::testDeadJobFallbackPayloadCleanup()
+6: PASS   : ArchiveExtractionJobTest::testMultipleConcurrentJobs()
+6: PASS   : ArchiveExtractionJobTest::testCompletedEntryReleased()
+6: PASS   : ArchiveExtractionJobTest::testStartupFailurePayloadAndEntryCleanup()
+6: QWARN  : ArchiveExtractionJobTest::testStartupFailurePayloadRemoveFailureRetry() kf.newstuff.core: Payload removal (simulated failure) "/tmp/startup_fail_retry_ecoEIV" after thread start failure; will retry
+6: PASS   : ArchiveExtractionJobTest::testStartupFailurePayloadRemoveFailureRetry()
+6: PASS   : ArchiveExtractionJobTest::testJobDestructionBeforeResultDelivery()
+6: PASS   : ArchiveExtractionJobTest::testJobDestructionAfterResultDelivery()
+6: PASS   : ArchiveExtractionJobTest::testSyntheticFailureSynchronousJobDestruction()
+6: PASS   : ArchiveExtractionJobTest::cleanupTestCase()
+6: Totals: 33 passed, 0 failed, 0 skipped, 0 blacklisted, 507ms
+6: ********* Finished testing of ArchiveExtractionJobTest *********
+2/2 Test #6: knewstuff-archiveextractionjobtest ...   Passed    0.64 sec
+
+The following tests passed:
+	knewstuff-installationtest
+	knewstuff-archiveextractionjobtest
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   4.04 sec
+CTEST_VERBOSE_EXIT_CODE=0
+
+-------------------------------------------------------------------------------
+SECTION E: CTest registration for the two tests (build/autotests/core/CTestTestfile.cmake)
+-------------------------------------------------------------------------------
+
+# CMake generated Testfile for 
+# Source directory: /home/prakhar/Github Projects/knewstuff/autotests/core
+# Build directory: /home/prakhar/Github Projects/knewstuff/build/autotests/core
+# 
+# This file includes the relevant testing commands required for 
+# testing this directory and lists subdirectories to be tested as well.
+add_test([=[knewstuff-knewstuffauthortest]=] "/home/prakhar/Github Projects/knewstuff/build/bin/knewstuffauthortest")
+set_tests_properties([=[knewstuff-knewstuffauthortest]=] PROPERTIES  ENVIRONMENT "QT_PLUGIN_PATH=/home/prakhar/Github Projects/knewstuff/build/bin" _BACKTRACE_TRIPLES "/usr/share/ECM/modules/ECMAddTests.cmake;389;add_test;/home/prakhar/Github Projects/knewstuff/autotests/CMakeLists.txt;20;ecm_add_test;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;19;knewstuff_unit_tests;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;0;")
+add_test([=[knewstuff-knewstuffenginetest]=] "/home/prakhar/Github Projects/knewstuff/build/bin/knewstuffenginetest")
+set_tests_properties([=[knewstuff-knewstuffenginetest]=] PROPERTIES  ENVIRONMENT "QT_PLUGIN_PATH=/home/prakhar/Github Projects/knewstuff/build/bin" _BACKTRACE_TRIPLES "/usr/share/ECM/modules/ECMAddTests.cmake;389;add_test;/home/prakhar/Github Projects/knewstuff/autotests/CMakeLists.txt;20;ecm_add_test;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;19;knewstuff_unit_tests;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;0;")
+add_test([=[knewstuff-installationtest]=] "/home/prakhar/Github Projects/knewstuff/build/bin/installationtest")
+set_tests_properties([=[knewstuff-installationtest]=] PROPERTIES  ENVIRONMENT "LANG=C" _BACKTRACE_TRIPLES "/usr/share/ECM/modules/ECMAddTests.cmake;389;add_test;/home/prakhar/Github Projects/knewstuff/autotests/CMakeLists.txt;20;ecm_add_test;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;19;knewstuff_unit_tests;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;0;")
+add_test([=[knewstuff-archiveextractionjobtest]=] "/home/prakhar/Github Projects/knewstuff/build/bin/archiveextractionjobtest")
+set_tests_properties([=[knewstuff-archiveextractionjobtest]=] PROPERTIES  ENVIRONMENT "QT_PLUGIN_PATH=/home/prakhar/Github Projects/knewstuff/build/bin" TIMEOUT "120" _BACKTRACE_TRIPLES "/usr/share/ECM/modules/ECMAddTests.cmake;389;add_test;/home/prakhar/Github Projects/knewstuff/autotests/CMakeLists.txt;20;ecm_add_test;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;19;knewstuff_unit_tests;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;0;")
+add_test([=[knewstuff-atticaprovidertest]=] "/home/prakhar/Github Projects/knewstuff/build/bin/atticaprovidertest")
+set_tests_properties([=[knewstuff-atticaprovidertest]=] PROPERTIES  ENVIRONMENT "QT_PLUGIN_PATH=/home/prakhar/Github Projects/knewstuff/build/bin" _BACKTRACE_TRIPLES "/usr/share/ECM/modules/ECMAddTests.cmake;389;add_test;/home/prakhar/Github Projects/knewstuff/autotests/CMakeLists.txt;20;ecm_add_test;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;27;knewstuff_unit_tests;/home/prakhar/Github Projects/knewstuff/autotests/core/CMakeLists.txt;0;")
+
+END OF REVIEW BUNDLE 6

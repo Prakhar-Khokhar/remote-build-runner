@@ -1,0 +1,944 @@
+================================================================================
+KNEWSTUFF PASS 2B.1 — REVIEW BUNDLE FILE 3 OF 6
+================================================================================
+Repository: /home/prakhar/Github Projects/knewstuff
+Branch: fix/install-freeze
+HEAD: cfaf92bbc888d2bfdbed97f06330c4f534eae1f7
+
+This file contains the complete current contents of:
+  - src/core/jobs/archiveextractionmanager.h
+  - src/core/jobs/archiveextractionmanager.cpp
+
+These are untracked files introduced/modified during Pass 2B.1.
+================================================================================
+
+================================================================================
+FILE 3A — src/core/jobs/archiveextractionmanager.h (COMPLETE)
+================================================================================
+
+#ifndef ARCHIVEEXTRACTIONMANAGER_H
+#define ARCHIVEEXTRACTIONMANAGER_H
+
+#include <QObject>
+#include <QThread>
+#include <QPointer>
+#include <QMutex>
+#include <QTimer>
+#include <atomic>
+#include <memory>
+#include <functional>
+#include <vector>
+
+#include "archiveextractionworker.h"
+#include "archiveextractionjob.h"
+
+namespace KNSCore
+{
+class ArchiveExtractionManager : public QObject
+{
+    Q_OBJECT
+public:
+    static ArchiveExtractionManager &instance();
+
+    // Non-copyable, non-movable
+    ArchiveExtractionManager(const ArchiveExtractionManager&) = delete;
+    ArchiveExtractionManager& operator=(const ArchiveExtractionManager&) = delete;
+    ArchiveExtractionManager(ArchiveExtractionManager&&) = delete;
+    ArchiveExtractionManager& operator=(ArchiveExtractionManager&&) = delete;
+
+    // Start an extraction; returns a handle (index) for cancellation/querying
+    int startExtraction(const QString &payloadFile,
+                        const QString &installDir,
+                        ArchiveExtractionJob::UncompressionOption uncompressionOption,
+                        ArchiveExtractionJob *job);
+
+    // Request cooperative cancellation for a specific extraction
+    void requestCancellation(int handle);
+
+    // Called by worker when it finishes (queued from worker thread)
+    void handleWorkerFinished(int handle,
+                              ArchiveExtractionWorker::ResultType result,
+                              const QStringList &files,
+                              const QString &errorMessage);
+
+    // Test-only: wait for all active extractions to complete (bounded)
+    bool waitForAllFinished(int timeoutMs = 5000);
+
+    // Test-only: get count of active extractions
+    int activeExtractionsCount() const;
+
+    // Test-only: suppress the queued interruption fallback for a specific handle
+    // When suppressed, requestCancellation() only sets the atomic flag without requesting thread interruption.
+    // This allows tests to isolate the atomic cancellation mechanism.
+    void setTestSuppressInterruptionFallback(int handle, bool suppress);
+
+    // Test-only: force the next startExtraction to simulate a failed thread start,
+    // exercising the synthetic failure path without exhausting OS thread resources.
+    void setTestForceStartFailure(bool force);
+
+    // Test-only: return the total number of non-null entries in m_entries,
+    // including entries already marked Done. Used to verify that completed
+    // entries are released from the manager even while the job is still alive.
+    int testTotalEntryCount() const;
+
+    // Test-only: make payload removal (QFile::remove) fail in cleanupPayloadIfNeeded
+    // and onPayloadCleanupTimer, to exercise the payload cleanup retry path.
+    void setTestPayloadRemoveFailure(bool force);
+
+private:
+    struct ExtractionEntry;
+
+    std::atomic<int> m_nextHandle{0};
+    mutable QMutex m_entriesMutex;
+    std::vector<std::shared_ptr<ExtractionEntry>> m_entries;
+
+    // Test-only: when true, the next startExtraction simulates a failed thread start.
+    bool m_testForceStartFailure = false;
+
+    // Test-only: when true, payload removal in cleanupPayloadIfNeeded simulates
+    // failure, exercising the payload cleanup retry path.
+    bool m_testPayloadRemoveFailure = false;
+
+    ArchiveExtractionManager(QObject *parent = nullptr);
+
+    ExtractionEntry* findEntry(int handle);
+    void reapEntry(ExtractionEntry *entry);
+    void scheduleReapRetry(int handle);
+    void onReapTimer(int handle);
+    bool tryFinalize(std::shared_ptr<ExtractionEntry> entry);
+    void releaseEntryFromVector(std::shared_ptr<ExtractionEntry> entry);
+    void deliverSyntheticFailure(std::shared_ptr<ExtractionEntry> entry,
+                                 const QString &errorMessage);
+    void cleanupPayloadIfNeeded(std::shared_ptr<ExtractionEntry> entry);
+    void schedulePayloadCleanupRetry(int handle);
+    void onPayloadCleanupTimer(int handle);
+};
+
+} // namespace KNSCore
+
+#endif // ARCHIVEEXTRACTIONMANAGER_H
+
+================================================================================
+FILE 3B — src/core/jobs/archiveextractionmanager.cpp (COMPLETE)
+================================================================================
+
+/*
+    SPDX-FileCopyrightText: 2024 KDE Contributors
+    SPDX-License-Identifier: LGPL-2.1-or-later
+*/
+
+#include "archiveextractionmanager.h"
+
+#include "archiveextractionworker.h"
+#include "archiveextractionjob.h"
+
+#include <KArchive>
+#include <KZip>
+#include <KTar>
+#include <KArchiveDirectory>
+#include <QMimeDatabase>
+#include <QMimeType>
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QThread>
+#include <QCoreApplication>
+#include <QMetaObject>
+#include <QPointer>
+#include <QTimer>
+
+#include <KLocalizedString>
+#include <QElapsedTimer>
+
+#include "knewstuffcore_debug.h"
+
+using namespace KNSCore;
+
+struct ArchiveExtractionManager::ExtractionEntry
+{
+    enum class State { Starting, Running, Finishing, Reaping, Done };
+    QString payloadFile;
+    QString installDir;
+    ArchiveExtractionJob::UncompressionOption uncompressionOption = ArchiveExtractionJob::NeverUncompress;
+    QPointer<ArchiveExtractionJob> job = nullptr;
+    std::shared_ptr<std::atomic<bool>> cancellation;
+    int handle = -1;
+    std::atomic<State> state{State::Starting};
+    QThread *thread = nullptr;
+    ArchiveExtractionWorker *worker = nullptr;
+
+    // Finalization flags (independent notifications):
+    // resultClaimed - worker result accepted for processing (set before invoking handlers)
+    // resultDisposed - job notification / payload disposition complete
+    // threadReaped   - wait(0) succeeded and QThread deleted
+    std::atomic<bool> resultClaimed{false};
+    std::atomic<bool> resultDisposed{false};
+    std::atomic<bool> threadReaped{false};
+
+    // Non-blocking reap retry state
+    bool reapRetryScheduled = false;
+
+    // Payload cleanup retry state
+    bool payloadCleanupRetryScheduled = false;
+
+    // Set to true when payload cleanup (QFile::remove) fails. The entry is not
+    // released from the manager's tracking vector until the payload is
+    // successfully removed or confirmed absent.
+    std::atomic<bool> payloadCleanupPending{false};
+
+    // Set to true when handleWorkerFinished observes a dead job (QPointer null).
+    // Used by cleanupPayloadIfNeeded to decide whether an unconsumed payload may be removed.
+    std::atomic<bool> jobDead{false};
+
+    // Test-only: callback to capture worker's terminal result even after job destruction
+    std::function<void(ArchiveExtractionWorker::ResultType)> testWorkerResultCallback;
+
+    // Test-only: suppress the queued interruption fallback in requestCancellation()
+    bool testSuppressInterruptionFallback = false;
+};
+
+ArchiveExtractionManager &ArchiveExtractionManager::instance()
+{
+    // Intentionally leaked singleton for process lifetime.
+    // Never destroyed during static teardown; no destructor runs.
+    static auto *manager = new ArchiveExtractionManager();
+    return *manager;
+}
+
+ArchiveExtractionManager::ArchiveExtractionManager(QObject *parent)
+    : QObject(parent)
+{
+    // Manager lives on the main thread (QApplication thread).
+    // All entry mutations must happen on this thread.
+    // Precondition: QCoreApplication must exist before manager is used.
+    Q_ASSERT_X(QCoreApplication::instance(), "ArchiveExtractionManager",
+               "QCoreApplication must be instantiated before ArchiveExtractionManager::instance()");
+    moveToThread(QCoreApplication::instance()->thread());
+}
+
+int ArchiveExtractionManager::startExtraction(const QString &payloadFile,
+                                              const QString &installDir,
+                                              ArchiveExtractionJob::UncompressionOption uncompressionOption,
+                                              ArchiveExtractionJob *job)
+{
+    // Must be called from manager's thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    const int handle = m_nextHandle.fetch_add(1, std::memory_order_relaxed);
+
+    auto entry = std::make_shared<ExtractionEntry>();
+    entry->payloadFile = payloadFile;
+    entry->installDir = installDir;
+    entry->uncompressionOption = uncompressionOption;
+    entry->job = job;
+    entry->handle = handle;
+    entry->state.store(ExtractionEntry::State::Starting, std::memory_order_release);
+
+    // Share the job's cancellation flag with the manager entry
+    if (job) {
+        entry->cancellation = job->cancellationFlag();
+    } else {
+        entry->cancellation = std::make_shared<std::atomic<bool>>(false);
+    }
+
+    // Store entry before starting thread (so cancellation/job destruction can find it)
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (static_cast<size_t>(handle) >= m_entries.size()) {
+            m_entries.resize(handle + 1);
+        }
+        m_entries[handle] = entry;
+    }
+
+    ExtractionEntry *storedEntry = entry.get();
+    Q_ASSERT(storedEntry);
+
+    // Install job-destruction observation BEFORE any result delivery.
+    // This ensures that even if startExtraction() synchronously emits a
+    // result (e.g., synthetic failure), the manager can track job destruction
+    // and release the entry once both notifications are complete.
+    if (storedEntry->job) {
+        QObject::connect(storedEntry->job, &QObject::destroyed,
+                         this, [this, handle]() {
+            QMetaObject::invokeMethod(this, [this, handle]() {
+                std::shared_ptr<ExtractionEntry> e;
+                {
+                    QMutexLocker locker(&m_entriesMutex);
+                    if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+                        e = m_entries[handle];
+                    }
+                }
+                if (!e) {
+                    return;
+                }
+                e->jobDead.store(true, std::memory_order_release);
+                if (e->resultDisposed.load(std::memory_order_acquire)
+                    && e->threadReaped.load(std::memory_order_acquire)) {
+                    cleanupPayloadIfNeeded(e);
+                }
+                tryFinalize(e);
+            }, Qt::QueuedConnection);
+        }, Qt::DirectConnection);
+    }
+
+    // Set the extraction handle on the job BEFORE any result delivery.
+    // If startExtraction() synchronously emits a result (e.g., synthetic
+    // failure) and the result handler destroys the job, the job destructor
+    // will see d->finished == true (set before emitResult in handleExtractionFailed)
+    // and will skip requestCancellation, leaving entry finalization to
+    // deliverSyntheticFailure -> tryFinalize, which is already in progress.
+    // The job-destruction connection installed above ensures the manager
+    // observes job destruction and releases the entry.
+    if (storedEntry->job) {
+        storedEntry->job->setExtractionHandle(handle);
+    }
+
+    // Corrected startup sequence: start the thread BEFORE creating/moving the worker.
+    // This avoids moving a worker into a thread whose native creation failed.
+    QThread *newThread = new QThread();
+    entry->thread = newThread;
+
+    bool started = false;
+    if (m_testForceStartFailure) {
+        // Deterministic test seam: simulate a failed native thread start.
+        started = false;
+    } else {
+        newThread->start();
+        started = newThread->isRunning();
+    }
+
+    if (!started) {
+        // Failed-start path: no worker was ever created or moved, so no consumer
+        // can claim the payload. Clean it up directly, finalize the entry, and
+        // report a synthetic terminal extraction failure.
+        delete newThread;
+        entry->thread = nullptr;
+        entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+        entry->threadReaped.store(true, std::memory_order_release);
+
+        if (!entry->payloadFile.isEmpty() && QFileInfo::exists(entry->payloadFile)) {
+            // Test-only: simulate payload removal failure to exercise the retry path.
+            if (m_testPayloadRemoveFailure) {
+                entry->payloadCleanupPending.store(true, std::memory_order_release);
+                schedulePayloadCleanupRetry(entry->handle);
+                qCWarning(KNEWSTUFFCORE) << "Payload removal (simulated failure)"
+                                         << entry->payloadFile << "after thread start failure; will retry";
+            } else if (!QFile::remove(entry->payloadFile)) {
+                // Payload removal failed. Retry later; do not release the entry
+                // until the payload is confirmed removed.
+                entry->payloadCleanupPending.store(true, std::memory_order_release);
+                schedulePayloadCleanupRetry(entry->handle);
+                qCWarning(KNEWSTUFFCORE) << "Failed to remove payload" << entry->payloadFile
+                                         << "after thread start failure; will retry";
+            }
+        }
+
+        deliverSyntheticFailure(entry, QStringLiteral("Archive extraction thread could not be started"));
+        return handle;
+    }
+
+    // Thread started successfully.
+
+    // Create the worker on the manager thread.
+    entry->worker = new ArchiveExtractionWorker(payloadFile, installDir,
+        static_cast<ArchiveExtractionWorker::UncompressionOption>(uncompressionOption),
+        entry->cancellation);
+
+    if (job) {
+        if (auto b = job->testBarrierAfterStarted()) {
+            entry->worker->setBarrierAfterStarted(b);
+        }
+        if (auto b = job->testBarrierBeforeCopyTo()) {
+            entry->worker->setBarrierBeforeCopyTo(b);
+        }
+        if (auto b = job->testBarrierBeforeCancellationCheck()) {
+            entry->worker->setBarrierBeforeCancellationCheck(b);
+        }
+        if (job->testWorkerStartedCallback()) {
+            entry->worker->setTestStartedCallback(job->testWorkerStartedCallback());
+        }
+        if (job->testBeforeCopyToCallback()) {
+            entry->worker->setTestBeforeCopyToCallback(job->testBeforeCopyToCallback());
+        }
+        if (job->testBeforeCancellationCheckCallback()) {
+            entry->worker->setTestBeforeCancellationCheckCallback(job->testBeforeCancellationCheckCallback());
+        }
+        if (job->testAboutToCopyToCallback()) {
+            entry->worker->setTestAboutToCopyToCallback(job->testAboutToCopyToCallback());
+        }
+        if (job->testPreCopyToCallback()) {
+            entry->worker->setTestPreCopyToCallback(job->testPreCopyToCallback());
+        }
+        if (!job->standardResourceDirectory().isEmpty()) {
+            entry->worker->setStandardResourceDirectory(job->standardResourceDirectory());
+        }
+        // Capture test worker result callback in entry so it persists after job destruction
+        if (job->testWorkerResultCallback()) {
+            entry->testWorkerResultCallback = job->testWorkerResultCallback();
+        }
+    }
+
+    entry->worker->moveToThread(newThread);
+
+    // Connections:
+    // 1. Worker finished -> thread quit (DirectConnection, thread-safe)
+    // 2. Worker finished -> manager.handleWorkerFinished (QueuedConnection, crosses to main thread)
+    // 3. Thread finished -> worker.deleteLater (DirectConnection, runs during thread shutdown)
+    // 4. Thread finished -> manager.reapEntry (QueuedConnection, crosses to main thread)
+
+    QObject::connect(storedEntry->worker, &ArchiveExtractionWorker::finished,
+                     newThread, &QThread::quit, Qt::DirectConnection);
+
+    QObject::connect(storedEntry->worker, &ArchiveExtractionWorker::finished,
+                     this, [this, handle](ArchiveExtractionWorker::ResultType result,
+                                          const QStringList &files,
+                                          const QString &errorMessage) {
+        QMetaObject::invokeMethod(this, [this, handle, result, files, errorMessage]() {
+            handleWorkerFinished(handle, result, files, errorMessage);
+        }, Qt::QueuedConnection);
+    }, Qt::DirectConnection);
+
+    QObject::connect(newThread, &QThread::finished,
+                     storedEntry->worker, &QObject::deleteLater, Qt::DirectConnection);
+
+    QObject::connect(newThread, &QThread::finished,
+                     this, [this, handle]() {
+        QMetaObject::invokeMethod(this, [this, handle]() {
+            ExtractionEntry *entry = findEntry(handle);
+            if (entry) {
+                reapEntry(entry);
+            }
+        }, Qt::QueuedConnection);
+    }, Qt::DirectConnection);
+
+    storedEntry->state.store(ExtractionEntry::State::Running, std::memory_order_release);
+    QMetaObject::invokeMethod(storedEntry->worker, "start", Qt::QueuedConnection);
+
+    return handle;
+}
+
+void ArchiveExtractionManager::requestCancellation(int handle)
+{
+    // Can be called from any thread (e.g., job destructor, doKill())
+    // Step 1: Set the cancellation flag immediately (thread-safe atomic)
+    std::shared_ptr<ExtractionEntry> entry;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            entry = m_entries[handle];
+        }
+    }
+
+    if (!entry) {
+        return; // Entry already reaped
+    }
+
+    entry->cancellation->store(true, std::memory_order_release);
+
+    // Step 2: Marshal thread-specific operation to manager thread via queued invocation.
+    QMetaObject::invokeMethod(this, [this, handle]() {
+        Q_ASSERT(QThread::currentThread() == thread());
+
+        std::shared_ptr<ExtractionEntry> e;
+        {
+            QMutexLocker locker(&m_entriesMutex);
+            if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+                e = m_entries[handle];
+            }
+        }
+
+        if (!e) {
+            return; // Entry already reaped - nothing to do
+        }
+
+        if (!e->testSuppressInterruptionFallback) {
+            QThread *workerThread = e->thread;
+            if (workerThread && workerThread->isRunning()) {
+                workerThread->requestInterruption();
+            }
+        }
+    }, Qt::QueuedConnection);
+}
+
+void ArchiveExtractionManager::handleWorkerFinished(int handle,
+                                                    ArchiveExtractionWorker::ResultType result,
+                                                    const QStringList &files,
+                                                    const QString &errorMessage)
+{
+    // Must be called from manager's thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    std::shared_ptr<ExtractionEntry> entry;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            entry = m_entries[handle];
+        }
+    }
+
+    if (!entry) {
+        return; // Already reaped/finalized
+    }
+
+    // Reentrancy guard: duplicate or reentrant result notifications are harmless.
+    if (entry->resultClaimed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    // Capture QPointer before dispatching; never dereference after a handler may emit result.
+    QPointer<ArchiveExtractionJob> job = entry->job;
+
+    // The worker's emitted result is authoritative. Do NOT override Success/FallbackRequired
+    // with Cancelled based on a late-arriving cancellation flag.
+    if (job) {
+        if (entry->job->testWorkerResultCallback()) {
+            entry->job->testWorkerResultCallback()(result);
+        }
+        switch (result) {
+            case ArchiveExtractionWorker::Success:
+                entry->job->handleSuccess(files);
+                break;
+            case ArchiveExtractionWorker::FallbackRequired:
+                entry->job->handleFallbackRequired();
+                break;
+            case ArchiveExtractionWorker::ExtractionFailed:
+                entry->job->handleExtractionFailed(errorMessage);
+                break;
+            case ArchiveExtractionWorker::Cancelled:
+                entry->job->handleCancelled();
+                break;
+        }
+    } else {
+        if (entry->testWorkerResultCallback) {
+            entry->testWorkerResultCallback(result);
+        }
+    }
+
+    // Result disposition is complete from the manager's perspective once handlers ran.
+    entry->resultDisposed.store(true, std::memory_order_release);
+
+    if (!job) {
+        // Job object already destroyed before result delivery. No live consumer remains.
+        entry->jobDead.store(true, std::memory_order_release);
+        // If the thread is already reaped, clean up any unconsumed payload now.
+        // Otherwise reapEntry will handle it once threadReaped becomes true.
+        if (entry->threadReaped.load(std::memory_order_acquire)) {
+            cleanupPayloadIfNeeded(entry);
+        }
+    }
+
+    // Attempt direct reaping if the thread has already finished.
+    QThread *workerThread = entry->thread;
+    if (workerThread && !entry->threadReaped.load(std::memory_order_acquire)) {
+        if (!workerThread->isRunning() && workerThread->wait(0)) {
+            delete workerThread;
+            entry->thread = nullptr;
+            entry->worker = nullptr;
+            entry->threadReaped.store(true, std::memory_order_release);
+            // If the job is dead, clean up any unconsumed payload now that
+            // both result delivery and physical reaping are complete.
+            if (entry->jobDead.load(std::memory_order_acquire)) {
+                cleanupPayloadIfNeeded(entry);
+            }
+        } else if (workerThread->isRunning()) {
+            entry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+            scheduleReapRetry(handle);
+            return;
+        }
+    }
+
+    // Physical reaping happens independently via reapEntry (scheduled by thread.finished).
+    // Finalize only when both resultDisposed && threadReaped are true.
+    tryFinalize(entry);
+}
+
+void ArchiveExtractionManager::deliverSyntheticFailure(std::shared_ptr<ExtractionEntry> entry,
+                                                       const QString &errorMessage)
+{
+    // Synthetic terminal failure for a thread that failed to start.
+    // No worker was ever created/moved, so no worker result exists; report failure directly.
+    QPointer<ArchiveExtractionJob> job = entry->job;
+    entry->resultClaimed.store(true, std::memory_order_release);
+
+    if (job) {
+        entry->job->handleExtractionFailed(errorMessage);
+    }
+
+    entry->resultDisposed.store(true, std::memory_order_release);
+    if (entry->jobDead.load(std::memory_order_acquire) || entry->job.isNull()) {
+        cleanupPayloadIfNeeded(entry);
+    }
+    tryFinalize(entry);
+}
+
+void ArchiveExtractionManager::cleanupPayloadIfNeeded(std::shared_ptr<ExtractionEntry> entry)
+{
+    // Remove an unconsumed temp payload only when both notifications are complete:
+    // resultDisposed (job notification/payload disposition complete) AND
+    // threadReaped (worker finished using the payload). The caller is responsible
+    // for ensuring no live job remains to consume the payload (checked via jobDead
+    // flag or QPointer::isNull() before calling this function).
+    // QFileInfo::exists guards against double-removal when a live fallback
+    // handler already renamed the file.
+    if (!entry->resultDisposed.load(std::memory_order_acquire)
+        || !entry->threadReaped.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const QString &payload = entry->payloadFile;
+    if (!payload.isEmpty() && QFileInfo::exists(payload)) {
+        // Test-only: simulate payload removal failure to exercise the retry path.
+        if (m_testPayloadRemoveFailure) {
+            entry->payloadCleanupPending.store(true, std::memory_order_release);
+            schedulePayloadCleanupRetry(entry->handle);
+            return;
+        }
+        if (!QFile::remove(payload)) {
+            // Payload removal failed. Retry later; do not consider cleanup done.
+            entry->payloadCleanupPending.store(true, std::memory_order_release);
+            schedulePayloadCleanupRetry(entry->handle);
+            qCWarning(KNEWSTUFFCORE) << "Failed to remove leftover payload" << payload
+                                     << "for handle" << entry->handle
+                                     << QFile().errorString();
+            return;
+        }
+    }
+}
+
+void ArchiveExtractionManager::reapEntry(ExtractionEntry *entry)
+{
+    // Must be called from manager's thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    if (!entry) {
+        return;
+    }
+
+    auto currentState = entry->state.load(std::memory_order_acquire);
+    if (currentState == ExtractionEntry::State::Done) {
+        return; // Already finalized
+    }
+    if (currentState == ExtractionEntry::State::Reaping) {
+        return; // Reaping in progress, avoid reentrancy
+    }
+
+    entry->state.store(ExtractionEntry::State::Reaping, std::memory_order_release);
+
+    // Obtain a shared_ptr that shares ownership with the vector's entry,
+    // so the entry cannot be destroyed while we are working on it.
+    std::shared_ptr<ExtractionEntry> sharedEntry;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (entry->handle >= 0 && entry->handle < static_cast<int>(m_entries.size())) {
+            sharedEntry = m_entries[entry->handle];
+        }
+    }
+    if (!sharedEntry) {
+        return; // Entry already finalized
+    }
+
+    QThread *workerThread = sharedEntry->thread;
+
+    if (!workerThread) {
+        // No thread (startup failure or test mode); physical side already complete.
+        sharedEntry->threadReaped.store(true, std::memory_order_release);
+        tryFinalize(sharedEntry);
+        return;
+    }
+
+    if (workerThread->isRunning()) {
+        // Thread has not yet stopped. Reset state so a later retry can proceed;
+        // do not call quit() as a substitute for joining; the worker's
+        // finished->thread.quit connection remains responsible for stopping.
+        // Schedule a retry; do not block the GUI thread.
+        sharedEntry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+        scheduleReapRetry(sharedEntry->handle);
+        return;
+    }
+
+    // Thread has finished. Attempt non-blocking join.
+    if (!workerThread->wait(0)) {
+        // join/cleanup still ongoing (e.g. TLS destructors). Reset state so a
+        // later retry can proceed, then schedule a retry.
+        sharedEntry->state.store(ExtractionEntry::State::Finishing, std::memory_order_release);
+        scheduleReapRetry(sharedEntry->handle);
+        return;
+    }
+
+    // wait(0) returned true for a thread known to have started successfully: safe to delete.
+    delete workerThread;
+    sharedEntry->thread = nullptr;
+    sharedEntry->worker = nullptr; // already deleteLater'd via thread.finished connection
+
+    sharedEntry->threadReaped.store(true, std::memory_order_release);
+
+    // tryFinalize defers removal if the job is still alive (waits for destroyed signal).
+    tryFinalize(sharedEntry);
+}
+
+void ArchiveExtractionManager::scheduleReapRetry(int handle)
+{
+    if (handle < 0) {
+        return;
+    }
+
+    // Ensure only one retry is outstanding per entry.
+    std::shared_ptr<ExtractionEntry> e;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            e = m_entries[handle];
+        }
+    }
+    if (!e) {
+        return;
+    }
+    if (e->reapRetryScheduled) {
+        return;
+    }
+    e->reapRetryScheduled = true;
+
+    // Context-bound single-shot timer on the manager; modest non-zero interval.
+    // 15 ms gives the extraction thread time to complete TLS cleanup without busy-spinning.
+    QTimer::singleShot(15, this, [this, handle]() {
+        onReapTimer(handle);
+    });
+}
+
+void ArchiveExtractionManager::onReapTimer(int handle)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    std::shared_ptr<ExtractionEntry> e;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            e = m_entries[handle];
+        }
+    }
+
+    if (!e) {
+        return; // Entry already finalized; stale callback is a no-op.
+    }
+
+    e->reapRetryScheduled = false;
+    reapEntry(e.get());
+}
+
+void ArchiveExtractionManager::schedulePayloadCleanupRetry(int handle)
+{
+    if (handle < 0) {
+        return;
+    }
+
+    // Ensure only one retry is outstanding per entry.
+    std::shared_ptr<ExtractionEntry> e;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            e = m_entries[handle];
+        }
+    }
+    if (!e) {
+        return;
+    }
+    if (e->payloadCleanupRetryScheduled) {
+        return;
+    }
+    e->payloadCleanupRetryScheduled = true;
+
+    // Context-bound single-shot timer on the manager; modest non-zero interval.
+    QTimer::singleShot(15, this, [this, handle]() {
+        onPayloadCleanupTimer(handle);
+    });
+}
+
+void ArchiveExtractionManager::onPayloadCleanupTimer(int handle)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    std::shared_ptr<ExtractionEntry> e;
+    {
+        QMutexLocker locker(&m_entriesMutex);
+        if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+            e = m_entries[handle];
+        }
+    }
+
+    if (!e) {
+        return; // Entry already finalized; stale callback is a no-op.
+    }
+
+    e->payloadCleanupRetryScheduled = false;
+
+    // Test-only: simulate payload removal failure to exercise repeated retries.
+    if (m_testPayloadRemoveFailure) {
+        e->payloadCleanupPending.store(true, std::memory_order_release);
+        schedulePayloadCleanupRetry(handle);
+        qCWarning(KNEWSTUFFCORE) << "Payload cleanup retry (simulated failure) for"
+                                 << e->payloadFile << "handle" << handle;
+        return;
+    }
+
+    // Retry payload removal. If the file is already gone, cleanup is considered
+    // done. If removal still fails, reschedule another retry (no arbitrary limit).
+    if (!e->payloadFile.isEmpty() && QFileInfo::exists(e->payloadFile)) {
+        if (!QFile::remove(e->payloadFile)) {
+            e->payloadCleanupPending.store(true, std::memory_order_release);
+            schedulePayloadCleanupRetry(handle);
+            qCWarning(KNEWSTUFFCORE) << "Payload cleanup retry failed for" << e->payloadFile
+                                     << "handle" << handle << QFile().errorString();
+            return;
+        }
+    }
+
+    // Payload is now confirmed removed. Clear the pending flag and finalize.
+    e->payloadCleanupPending.store(false, std::memory_order_release);
+    tryFinalize(e);
+}
+
+bool ArchiveExtractionManager::tryFinalize(std::shared_ptr<ExtractionEntry> entry)
+{
+    if (!entry) {
+        return false;
+    }
+
+    // Finalization invariant: both result delivery and physical reaping must be complete.
+    if (!entry->resultDisposed.load(std::memory_order_acquire)
+        || !entry->threadReaped.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    if (entry->state.load(std::memory_order_acquire) == ExtractionEntry::State::Done) {
+        // Already marked Done. Clean up payload if job is dead, then release entry
+        // only if payload cleanup is not pending.
+        if (entry->jobDead.load(std::memory_order_acquire)
+            || entry->job.isNull()) {
+            cleanupPayloadIfNeeded(entry);
+        }
+        if (!entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+            releaseEntryFromVector(entry);
+        }
+        return true;
+    }
+
+    // Clean up any unconsumed payload only if the job is dead (no live consumer).
+    // A live fallback handler may still consume/rename the payload; the manager
+    // must not remove it before that handler has returned.
+    if (entry->jobDead.load(std::memory_order_acquire)
+        || entry->job.isNull()) {
+        cleanupPayloadIfNeeded(entry);
+    }
+
+    entry->state.store(ExtractionEntry::State::Done, std::memory_order_release);
+
+    // Do NOT remove from vector yet if the job is still alive — the job's
+    // destroyed signal callback will call tryFinalize again (Done branch),
+    // which will set jobDead, clean up payload, and release the entry.
+    // Also do NOT remove if payload cleanup is pending (removal failed); the
+    // payload cleanup retry will call tryFinalize again once the payload is gone.
+    if ((entry->jobDead.load(std::memory_order_acquire)
+         || entry->job.isNull())
+        && !entry->payloadCleanupPending.load(std::memory_order_acquire)) {
+        releaseEntryFromVector(entry);
+    }
+
+    return true;
+}
+
+bool ArchiveExtractionManager::waitForAllFinished(int timeoutMs)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    QElapsedTimer timer;
+    timer.start();
+
+    while (true) {
+        int active = 0;
+        {
+            QMutexLocker locker(&m_entriesMutex);
+            for (const auto &entry : m_entries) {
+                if (entry && entry->state.load(std::memory_order_acquire) != ExtractionEntry::State::Done) {
+                    active++;
+                }
+            }
+        }
+
+        if (active == 0) {
+            return true;
+        }
+
+        if (timer.elapsed() >= timeoutMs) {
+            return false;
+        }
+
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
+}
+
+int ArchiveExtractionManager::activeExtractionsCount() const
+{
+    QMutexLocker locker(&m_entriesMutex);
+    int count = 0;
+    for (const auto &entry : m_entries) {
+        if (entry && entry->state.load(std::memory_order_acquire) != ExtractionEntry::State::Done) {
+            count++;
+        }
+    }
+    return count;
+}
+
+ArchiveExtractionManager::ExtractionEntry* ArchiveExtractionManager::findEntry(int handle)
+{
+    QMutexLocker locker(&m_entriesMutex);
+    if (handle >= 0 && handle < static_cast<int>(m_entries.size())) {
+        return m_entries[handle].get();
+    }
+    return nullptr;
+}
+
+void ArchiveExtractionManager::setTestSuppressInterruptionFallback(int handle, bool suppress)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    ExtractionEntry *entry = findEntry(handle);
+    if (entry) {
+        entry->testSuppressInterruptionFallback = suppress;
+    }
+}
+
+void ArchiveExtractionManager::setTestForceStartFailure(bool force)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_testForceStartFailure = force;
+}
+
+void ArchiveExtractionManager::setTestPayloadRemoveFailure(bool force)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_testPayloadRemoveFailure = force;
+}
+
+void ArchiveExtractionManager::releaseEntryFromVector(std::shared_ptr<ExtractionEntry> entry)
+{
+    QMutexLocker locker(&m_entriesMutex);
+    if (entry->handle >= 0 && entry->handle < static_cast<int>(m_entries.size())) {
+        m_entries[entry->handle].reset();
+    }
+}
+
+int ArchiveExtractionManager::testTotalEntryCount() const
+{
+    QMutexLocker locker(&m_entriesMutex);
+    int count = 0;
+    for (const auto &e : m_entries) {
+        if (e) {
+            count++;
+        }
+    }
+    return count;
+}
+
+================================================================================
+END OF BUNDLE FILE 3
+================================================================================

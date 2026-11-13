@@ -1,0 +1,4 @@
+mode=delete-noread
+  [probe] result handler entered; job=0x37f40e90 alive=1
+  [probe] handler calling delete job (synchronous destruction)
+  [probe] handler returned; job alive=0

@@ -1,0 +1,2145 @@
+===============================================================================
+REVIEW BUNDLE 4 of 7 - EXTRACTION REGRESSION TEST (COMPLETE) + CMake CHANGES
+===============================================================================
+Generated (UTC): 2026-11-13 16:35:02 UTC
+
+-------------------------------------------------------------------------------
+PART A: autotests/core/archiveextractionjobtest.cpp  (COMPLETE FILE, %s lines)
+1814
+-------------------------------------------------------------------------------
+
+/*
+    This file is part of KNewStuff3
+    SPDX-FileCopyrightText: 2024 KDE Contributors
+
+    SPDX-License-Identifier: LGPL-2.1-or-later
+*/
+
+#include <QDir>
+#include <QSignalSpy>
+#include <QTest>
+#include <QThread>
+#include <QTemporaryFile>
+#include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QPointer>
+#include <QFileInfo>
+#include <QSemaphore>
+#include <QStandardPaths>
+#include <memory>
+#include <atomic>
+#include <cstdlib>
+
+#include <KLocalizedString>
+
+#include "entry.h"
+#include "installation_p.h"
+#include "jobs/archiveextractionjob.h"
+#include "jobs/archiveextractionmanager.h"
+#include "filesystemmutex.h"
+
+using namespace KNSCore;
+
+// Shared ownership for test synchronization objects
+// Ensures barriers and callbacks remain alive as long as any worker could access them
+using SemaphorePtr = std::shared_ptr<QSemaphore>;
+
+// Thread-safe test state holder for callbacks that may execute asynchronously
+// Uses shared_ptr + atomic to ensure lifetime extends beyond test scope
+template<typename T>
+struct TestState {
+    std::shared_ptr<std::atomic<T>> value;
+    TestState(T initial = T{}) : value(std::make_shared<std::atomic<T>>(initial)) {}
+    T load() const { return value->load(std::memory_order_acquire); }
+    void store(T v) { value->store(v, std::memory_order_release); }
+    void increment() { value->fetch_add(1, std::memory_order_acq_rel); }
+};
+
+// Robust scope guard for test cleanup
+// Ensures cancellation is requested, barriers are released, and worker/manager completion waited for
+// CRITICAL: Bounded wait with safe termination strategy.
+// - Requests cancellation FIRST if job is still active (so workers observe cancellation at next checkpoint)
+// - Releases barriers AFTER cancellation requested (unblocks workers to hit their cancellation checkpoints)
+// - Waits for manager cleanup with generous timeout
+// - If timeout expires with active workers, calls std::quick_exit to avoid unsafe process exit
+// - Never destroys a running QThread. Never frees worker-owned state while its thread may still be using it.
+// - Never uses nested GUI event loops or unsafe forced deletion as a workaround.
+// - Note: KArchiveDirectory::copyTo() is non-interruptible; a worker blocked in copyTo() will not see
+//   cancellation until copyTo() returns. This is an inherent limitation of the archive library.
+struct TestScope {
+    explicit TestScope(ArchiveExtractionJob* job = nullptr)
+        : m_job(job)
+        , m_manager(&ArchiveExtractionManager::instance())
+    {}
+
+    // Non-copyable, non-movable: owns barriers and manages cleanup; copying would duplicate
+    // barrier ownership and cause double-release or missed cleanup.
+    TestScope(const TestScope&) = delete;
+    TestScope& operator=(const TestScope&) = delete;
+    TestScope(TestScope&&) = delete;
+    TestScope& operator=(TestScope&&) = delete;
+
+    ~TestScope() {
+        // 1. Request cancellation FIRST if job still exists and hasn't finished.
+        // This ensures that when barriers are released, workers will observe
+        // the cancellation flag at their next checkpoint.
+        if (m_job && m_job->error() == KJob::NoError) {
+            m_job->kill();
+        }
+
+        // 2. Release all barriers to unblock any waiting worker at their checkpoints.
+        // Ordering: cancellation requested FIRST, then barriers released.
+        // Workers resume and immediately hit their next cancellation checkpoint.
+        for (auto& s : m_barriers) {
+            if (s) s->release();
+        }
+
+        // 3. Wait for manager to clean up all entries with bounded timeout
+        constexpr int cleanupTimeoutMs = 30000; // Generous timeout for worker completion + thread shutdown
+        QElapsedTimer timer;
+        timer.start();
+        while (!m_manager->waitForAllFinished(1000)) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+            if (timer.elapsed() >= cleanupTimeoutMs) {
+                // Timeout: emit diagnostic with manager/entry state
+                qCritical() << "TestScope cleanup timeout after" << cleanupTimeoutMs << "ms";
+                qCritical() << "Active extractions count:" << m_manager->activeExtractionsCount();
+                qCritical() << "Worker threads may still be running. Terminating test process to avoid unsafe exit.";
+                
+                // Use std::quick_exit to terminate without destroying C++ objects
+                // (which could race with still-running worker threads).
+                // This is the safest option when threads cannot be joined.
+                std::quick_exit(EXIT_FAILURE);
+            }
+        }
+
+        // 4. Process any remaining events
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 100);
+    }
+
+    // Register a barrier that should be released on cleanup
+    void addBarrier(SemaphorePtr barrier) {
+        if (barrier) m_barriers.push_back(std::move(barrier));
+    }
+
+    // Register the job under test
+    void setJob(ArchiveExtractionJob* job) {
+        m_job = job;
+    }
+
+private:
+    QPointer<ArchiveExtractionJob> m_job;
+    ArchiveExtractionManager* m_manager = nullptr;
+    std::vector<SemaphorePtr> m_barriers;
+};
+
+// Helper to create a shared semaphore
+inline SemaphorePtr makeSemaphore(int initial = 0) {
+    return std::make_shared<QSemaphore>(initial);
+}
+
+// Safe wrapper for waiting on a semaphore with timeout
+// Returns true if acquired, false on timeout
+inline bool tryAcquire(SemaphorePtr sem, int timeoutMs = 5000) {
+    return sem && sem->tryAcquire(1, timeoutMs);
+}
+
+// Helper to release a shared semaphore
+inline void release(SemaphorePtr sem) {
+    if (sem) sem->release();
+}
+
+// Test-scoped temporary file that auto-removes on scope exit
+    // Ensures cleanup even on test failure
+    struct ScopedTempFile {
+        explicit ScopedTempFile(const QString& templateName = QString())
+            : m_file(std::make_unique<QTemporaryFile>(templateName)) {
+            m_file->setAutoRemove(true);
+        }
+
+        // Move-only type
+        ScopedTempFile(ScopedTempFile&& other) noexcept = default;
+        ScopedTempFile& operator=(ScopedTempFile&& other) noexcept = default;
+        ScopedTempFile(const ScopedTempFile&) = delete;
+        ScopedTempFile& operator=(const ScopedTempFile&) = delete;
+
+        bool open() { return m_file->open(); }
+        QString fileName() const { return m_file->fileName(); }
+        QTemporaryFile* operator->() { return m_file.get(); }
+        QTemporaryFile& operator*() { return *m_file; }
+
+    private:
+        std::unique_ptr<QTemporaryFile> m_file;
+    };
+
+class ArchiveExtractionJobTest : public QObject
+{
+    Q_OBJECT
+public:
+    const QString dataDir = QStringLiteral(DATA_DIR);
+
+private Q_SLOTS:
+    void initTestCase();
+    void cleanup();
+    void cleanupTestCase();
+    void testSuccessfulExtraction();
+    void testSuccessfulExtractionTopLevelFiles();
+    void testCorruptArchiveAlwaysUncompress();
+    void testCorruptArchiveWithFallback();
+    void testNonArchiveFile();
+    void testUnknownMimeUncompressIntoSubdir();
+    void testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir();
+    void testCancellationBeforeStart();
+    void testCancellationAfterWorkerCreationBeforeExecution();
+    void testCancellationBeforeCopyTo();
+    void testCancellationBeforeCancellationCheck();
+    void testJobDestructionWhileWorkerBlockedAtPreCopyToBarrier();
+    void testGuiResponsivenessDuringExtraction();
+    void testKillAfterCompletionNoOp();
+    void testFallbackPayloadCleanupOnCancellation();
+    void testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback();
+    void testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback();
+    void testUnknownMimeAlwaysUncompressError();
+    void testDestructionBeforeThreadStart();
+    void testDestructionAfterThreadStartBeforeWorkerExecution();
+    void testCancellationWhileWorkerBlockedAtStartup();
+    void testManagerMediatedCancellation();
+    void testThreadCreationFailure();
+    void testDeadJobFallbackPayloadCleanup();
+    void testMultipleConcurrentJobs();
+    void testCompletedEntryReleased();
+    void testStartupFailurePayloadAndEntryCleanup();
+    void testStartupFailurePayloadRemoveFailureRetry();
+    void testJobDestructionBeforeResultDelivery();
+    void testJobDestructionAfterResultDelivery();
+    void testSyntheticFailureSynchronousJobDestruction();
+};
+
+void ArchiveExtractionJobTest::initTestCase()
+{
+    qRegisterMetaType<QStringList>();
+    QStandardPaths::setTestModeEnabled(true);
+
+    // Initialize KI18n on the main thread before any worker starts
+    // This prevents cross-thread QObject warnings when i18n() is first called from a worker thread
+    // Set application domain to ensure proper initialization
+    KLocalizedString::setApplicationDomain("knewstuff-test");
+}
+
+void ArchiveExtractionJobTest::cleanup()
+{
+    // Wait for any pending extractions to complete before next test
+    // This ensures clean state between tests since manager is a singleton
+    const bool cleaned = ArchiveExtractionManager::instance().waitForAllFinished(5000);
+    if (!cleaned) {
+        const int activeCount = ArchiveExtractionManager::instance().activeExtractionsCount();
+        qCritical() << "ArchiveExtractionJobTest::cleanup: waitForAllFinished timed out after 5000ms";
+        qCritical() << "Active extractions count:" << activeCount;
+        qCritical() << "Extraction workers may still be running. Terminating test process to avoid unsafe exit.";
+        std::quick_exit(EXIT_FAILURE);
+    }
+
+    // Do not clear destination mutexes here - mutexes are process-lifetime and
+    // clearing them while worker threads might still be running is unsafe.
+    // Mutexes will be cleaned up at process exit.
+}
+
+void ArchiveExtractionJobTest::cleanupTestCase()
+{
+    // Wait for any outstanding extractions to complete before cleaning up shared data
+    // This prevents removing the demo/ directory while workers might still be writing to it
+    const bool waitSucceeded = ArchiveExtractionManager::instance().waitForAllFinished(10000);
+    if (!waitSucceeded) {
+        const int activeCount = ArchiveExtractionManager::instance().activeExtractionsCount();
+        qCritical() << "ArchiveExtractionJobTest::cleanupTestCase: waitForAllFinished timed out after 10000ms";
+        qCritical() << "Active extractions count:" << activeCount;
+        qCritical() << "Shared installation data (demo/) will NOT be removed to avoid data corruption.";
+        qCritical() << "Terminating test process to avoid unsafe exit with active workers.";
+        std::quick_exit(EXIT_FAILURE);
+    }
+
+    const QString dataPath = QStandardPaths::locate(QStandardPaths::GenericDataLocation, QStringLiteral("demo/"), QStandardPaths::LocateDirectory);
+    if (!dataPath.isEmpty()) {
+        QDir(dataPath).removeRecursively();
+    }
+    // Mutexes are process-lifetime; no need to clear them.
+}
+
+void ArchiveExtractionJobTest::testSuccessfulExtraction()
+{
+    // Test successful async archive extraction with subdirectory
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    QStringList installedFiles = job->installedFiles();
+    QCOMPARE(installedFiles.count(), 1);
+    QVERIFY(installedFiles.first().endsWith(QLatin1String("/*")));
+
+    const QFileInfo fileInfo(installedFiles.first().left(installedFiles.first().size() - 2));
+    QVERIFY(fileInfo.exists());
+    QVERIFY(fileInfo.isDir());
+
+    const QStringList files = QDir(fileInfo.absoluteFilePath()).entryList(QDir::Filter::Files | QDir::Filter::NoDotAndDotDot);
+    QCOMPARE(files, QStringList({QStringLiteral("test1.txt"), QStringLiteral("test2.txt")}));
+
+    // Payload should be removed on Success
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testSuccessfulExtractionTopLevelFiles()
+{
+    // Test successful async archive extraction with top-level files
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_toplevel_files.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    QStringList installedFiles = job->installedFiles();
+    QCOMPARE(installedFiles.count(), 1);
+    QVERIFY(installedFiles.first().endsWith(QLatin1String("/*")));
+
+    const QFileInfo fileInfo(installedFiles.first().left(installedFiles.first().size() - 2));
+    QVERIFY(fileInfo.exists());
+    QVERIFY(fileInfo.isDir());
+
+    const QStringList files = QDir(fileInfo.absoluteFilePath()).entryList(QDir::Filter::Files | QDir::Filter::NoDotAndDotDot);
+    QCOMPARE(files, QStringList({QStringLiteral("test1.txt"), QStringLiteral("test2.txt")}));
+
+    // Payload should be removed on Success
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCorruptArchiveAlwaysUncompress()
+{
+    // Test corrupt archive handling with AlwaysUncompress (should error, payload removed)
+    ScopedTempFile corruptArchive;
+    QVERIFY(corruptArchive.open());
+    corruptArchive->write("This is not a valid archive");
+    corruptArchive->flush();
+    QString payloadFile = corruptArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::AlwaysUncompress);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCorruptArchiveWithFallback()
+{
+    // Test corrupt archive handling with UncompressIfArchive (should request fallback, payload preserved)
+    ScopedTempFile corruptArchive;
+    QVERIFY(corruptArchive.open());
+    corruptArchive->write("This is not a valid archive");
+    corruptArchive->flush();
+    QString payloadFile = corruptArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // For corrupt archive with UncompressIfArchive, the job should succeed (no error) but request fallback
+    QVERIFY(!job->error());
+    QCOMPARE(job->property("fallbackRequired").toBool(), true);
+    QCOMPARE(job->installedFiles().count(), 0);
+
+    // Payload should be preserved on FallbackRequired (caller will consume it)
+    QVERIFY(QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testNonArchiveFile()
+{
+    // Test non-archive file with UncompressIfArchive (should request fallback, payload preserved)
+    QString payloadFile = dataDir + QStringLiteral("testfile.txt");
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // For non-archive with UncompressIfArchive, the job succeeds but requests fallback
+    QVERIFY(!job->error());
+    QCOMPARE(job->property("fallbackRequired").toBool(), true);
+    QCOMPARE(job->installedFiles().count(), 0);
+
+    // Payload should be preserved on FallbackRequired (caller will consume it)
+    QVERIFY(QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testUnknownMimeUncompressIntoSubdir()
+{
+    // Test unknown MIME type with UncompressIntoSubdir - should fail with ExtractionFailed
+    // UncompressIntoSubdir requires successful extraction; unknown MIME is a failure
+    ScopedTempFile unknownFile;
+    QVERIFY(unknownFile.open());
+    unknownFile->write("This is not a recognized archive format");
+    unknownFile->flush();
+    QString payloadFile = unknownFile.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdir);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // Should fail with ExtractionFailed
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+    QCOMPARE(job->property("fallbackRequired").toBool(), false);
+    QCOMPARE(job->installedFiles().count(), 0);
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdir()
+{
+    // Test empty/corrupt archive after successful open with UncompressIntoSubdir
+    // Creates a .tar.gz file with invalid content - KTar opens it but finds 0 entries
+    // This exercises the "empty archive after open" path, NOT the "open failure" path
+    ScopedTempFile corruptArchive;
+    corruptArchive->setFileTemplate(QDir::tempPath() + "/corrupt_XXXXXX.tar.gz");
+    QVERIFY(corruptArchive.open());
+    corruptArchive->write("This looks like a tar but is corrupt");
+    corruptArchive->flush();
+    QString payloadFile = corruptArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdir);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // Should fail with ExtractionFailed (archive opens but is empty/corrupt)
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCancellationBeforeStart()
+{
+    // Test cancellation before extraction starts (kill before start)
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    bool kr = job->kill(KJob::EmitResult);
+    Q_UNUSED(kr);
+    job->start();
+
+    // Check spy count immediately - signal should have been emitted by kill()
+    QCOMPARE(spy.count(), 1);
+
+    // Job should be killed
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // Payload should be removed on Cancelled (no fallback consumer)
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCancellationAfterWorkerCreationBeforeExecution()
+{
+    // Test cancellation after worker thread created but before worker executes doWork()
+    // Uses barrier to deterministically block worker at startup checkpoint
+    auto barrier = makeSemaphore();
+    auto workerStartedSem = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the barrier after started() is emitted
+    job->setTestBarrierAfterStarted(barrier);
+
+    // Set callback to be notified when worker emits started()
+    job->setTestWorkerStartedCallback([workerStartedSem]() {
+        workerStartedSem->release();
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to emit started() and block at barrier
+    // This proves worker thread exists and has reached the first checkpoint
+    QVERIFY(tryAcquire(workerStartedSem, 5000));
+
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 1);
+
+    // Request cancellation while worker is blocked at barrier
+    // Worker has been created, thread started, but doWork() not yet executed past first checkpoint
+    job->kill();
+
+    // Release barrier to allow worker to proceed
+    release(barrier);
+
+    QVERIFY(spy.wait(5000));
+    // Should report KilledJobError
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // Payload should be removed on Cancelled
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCancellationBeforeCopyTo()
+{
+    // Test cancellation before copyTo - worker blocked at the barrier before the new
+    // pre-copyTo cancellation checkpoint. Proves the new checkpoint is effective.
+    // Uses a unique destination directory so previous test output cannot affect the assertion.
+    auto barrier = makeSemaphore();
+    auto workerAtBarrierSem = makeSemaphore();
+    TestState<bool> preCopyToReached(false);
+
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    // Use a unique destination directory for this test
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo_testCancellationBeforeCopyTo/");
+    QDir().mkpath(installDir);
+    // Ensure destination is empty at start
+    QVERIFY(QDir(installDir).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the barrier before copyTo (after aboutToCopyTo, before checkpoint)
+    job->setTestBarrierBeforeCopyTo(barrier);
+
+    // Callback fires when worker reaches the barrier (before the new checkpoint)
+    job->setTestBeforeCopyToCallback([workerAtBarrierSem]() {
+        workerAtBarrierSem->release();
+    });
+
+    // Observation point: fires AFTER the new pre-copyTo cancellation checkpoint but BEFORE copyTo()
+    // If this fires, the checkpoint was passed (cancellation not observed at checkpoint).
+    // If cancellation is requested while worker is blocked at barrier, the checkpoint should
+    // catch it and this callback should NEVER fire.
+    job->setTestPreCopyToCallback([preCopyToReached]() mutable {
+        preCopyToReached.store(true);
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to reach the barrier (proves: MIME checked, archive opened, mutex acquired, aboutToCopyTo emitted)
+    QVERIFY(tryAcquire(workerAtBarrierSem, 5000));
+
+    // Request cancellation while worker is blocked at the barrier, BEFORE the new checkpoint
+    job->kill();
+
+    // Release barrier to allow worker to proceed
+    // Worker will hit the new cancellation checkpoint after barrier and before copyTo()
+    release(barrier);
+
+    QVERIFY(spy.wait(5000));
+    // Should report KilledJobError
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // The pre-copyTo observation point must NOT have been reached - proves the new checkpoint caught cancellation
+    QVERIFY(!preCopyToReached.load());
+
+    // Payload should be removed on Cancelled
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    // Destination must remain empty - no partial extraction occurred
+    QVERIFY(QDir(installDir).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testCancellationBeforeCancellationCheck()
+{
+    // Test cancellation at the first pre-copyTo cancellation check (after mutex acquisition)
+    // Uses a dedicated barrier that fires after mutex acquisition but BEFORE the cancellation check
+    // This proves cancellation is observed by the first checkpoint that guards copyTo()
+    auto barrier = makeSemaphore();
+    auto workerAtCancellationCheckSem = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the pre-cancellation-check barrier
+    job->setTestBarrierBeforeCancellationCheck(barrier);
+
+    // Set callback to be notified when worker reaches the point after mutex but before cancellation check
+    job->setTestBeforeCancellationCheckCallback([workerAtCancellationCheckSem]() {
+        workerAtCancellationCheckSem->release();
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy resultSpy(job, &KJob::result);
+    // Use TestState for lifetime-safe callback state (callbacks may execute asynchronously)
+    TestState<int> aboutToCopyToCount;
+    job->setTestAboutToCopyToCallback([aboutToCopyToCount]() mutable {
+        aboutToCopyToCount.increment();
+    });
+    job->start();
+
+    // Wait for worker to reach the pre-cancellation-check checkpoint
+    // This proves: MIME checked, archive opened, mutex acquired, about to check cancellation
+    QVERIFY(tryAcquire(workerAtCancellationCheckSem, 5000));
+
+    // Request cancellation while worker is blocked before the cancellation check
+    job->kill();
+
+    // Release barrier to allow worker to proceed
+    release(barrier);
+
+    QVERIFY(resultSpy.wait(5000));
+    // Should report KilledJobError - cancellation was observed by the checkpoint
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // Payload should be removed on Cancelled
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    // The worker should have cancelled before emitting aboutToCopyTo or entering copyTo()
+    // Verify zero emissions of aboutToCopyTo - proves pre-check cancellation, not post-copyTo
+    QCOMPARE(aboutToCopyToCount.load(), 0);
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testJobDestructionWhileWorkerBlockedAtPreCopyToBarrier()
+{
+    // Test destruction while worker is blocked at the pre-copyTo barrier (after doWork has started).
+    // Synchronization point: worker has passed MIME check, opened archive, acquired mutex, emitted aboutToCopyTo,
+    // and is blocked at the test barrier BEFORE the pre-copyTo cancellation checkpoint.
+    // This test verifies that manager retains ownership and cleans up after job destruction,
+    // and that destruction propagates cancellation (worker result is Cancelled, not Success).
+    // Note: This is NOT a pre-doWork destruction test. For pre-doWork destruction coverage,
+    // see testDestructionBeforeThreadStart and testDestructionAfterThreadStartBeforeWorkerExecution.
+    auto barrier = makeSemaphore();
+    auto workerAtBarrierSem = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    // Use a unique destination directory for this test
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo_testJobDestructionWhileWorkerBlockedAtPreCopyToBarrier/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the barrier before copyTo
+    job->setTestBarrierBeforeCopyTo(barrier);
+
+    // Set callback to be notified when worker reaches the pre-copyTo barrier
+    job->setTestBeforeCopyToCallback([workerAtBarrierSem]() {
+        workerAtBarrierSem->release();
+    });
+
+    // Capture worker's terminal result via test-only callback using lifetime-safe TestState
+    TestState<ArchiveExtractionWorker::ResultType> observedWorkerResult(ArchiveExtractionWorker::Success);
+    job->setTestWorkerResultCallback([observedWorkerResult](ArchiveExtractionWorker::ResultType result) mutable {
+        observedWorkerResult.store(result);
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy resultSpy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to reach the pre-copyTo barrier
+    // This proves: MIME checked, archive opened, mutex acquired, aboutToCopyTo emitted
+    QVERIFY(tryAcquire(workerAtBarrierSem, 5000));
+
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+
+    // Verify manager has the entry
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 1);
+
+    // Delete job while worker is blocked at pre-copyTo barrier - manager retains ownership
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+
+    // Release barrier from test thread to allow worker to proceed and finish
+    release(barrier);
+
+    // Give time for worker to finish and manager to clean up
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(10000));
+
+    // Verify worker's actual terminal result was Cancelled (not Success)
+    // This proves destruction propagated cancellation, not that extraction succeeded
+    QCOMPARE(observedWorkerResult.load(), ArchiveExtractionWorker::Cancelled);
+
+    // Verify payload cleaned up (worker completed with Cancelled, which cleans up payload)
+    QVERIFY(!QFileInfo::exists(payloadFile));
+}
+
+void ArchiveExtractionJobTest::testGuiResponsivenessDuringExtraction()
+{
+    // Test that the GUI event loop remains responsive during extraction
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    // Process events a few times to verify GUI responsiveness
+    for (int i = 0; i < 10; ++i) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    }
+
+    // Job should complete successfully
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    // Payload should be removed on Success
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testKillAfterCompletionNoOp()
+{
+    // Test that calling kill() after job completion is a no-op and doesn't change the result.
+    // This verifies the job's finished state is respected - once the worker has committed
+    // its result (Success/FallbackRequired/ExtractionFailed/Cancelled), subsequent kill()
+    // calls have no effect. This is NOT a cancellation race test; it verifies post-completion
+    // idempotency. For genuine cancellation-vs-completion race coverage, see
+    // testCancellationBeforeCopyTo and testManagerMediatedCancellation which synchronize
+    // at deterministic pre-copyTo checkpoints.
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    // Wait for completion - worker should succeed
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    // Now test that calling kill after completion doesn't change result
+    // (worker already finished, so kill does nothing)
+    job->kill();
+
+    // Verify result is still Success
+    QVERIFY(!job->error());
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testFallbackPayloadCleanupOnCancellation()
+{
+    // Test that payload is cleaned up when FallbackRequired is overridden by cancellation
+    // Use UncompressIfArchive with a non-archive file - worker would return FallbackRequired
+    // but if kill() wins the race at the first checkpoint, the payload should be cleaned up.
+    // Use barrier to deterministically block worker at first checkpoint.
+    auto barrier = makeSemaphore();
+    auto workerStartedSem = makeSemaphore();
+    ScopedTempFile tempFile;
+    tempFile->setAutoRemove(false); // We'll verify cleanup manually
+    QVERIFY(tempFile.open());
+    tempFile->write("test payload content for fallback cancellation cleanup");
+    tempFile->flush();
+    tempFile->close();
+    QString tempPayloadFile = tempFile.fileName();
+    tempFile->setAutoRemove(true); // Will auto-remove if test fails
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(tempPayloadFile, installDir, ArchiveExtractionJob::UncompressIfArchive);
+
+    // Configure worker to block at the first checkpoint (after started())
+    job->setTestBarrierAfterStarted(barrier);
+    job->setTestWorkerStartedCallback([workerStartedSem]() {
+        workerStartedSem->release();
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy spy(job, &KJob::result);
+
+    // Start job
+    job->start();
+
+    // Wait for worker to emit started() and block at barrier
+    QVERIFY(tryAcquire(workerStartedSem, 5000));
+
+    // Request cancellation while worker is blocked at first checkpoint
+    // At this point, worker hasn't checked MIME type yet
+    job->kill();
+
+    // Release barrier to allow worker to proceed
+    release(barrier);
+
+    QVERIFY(spy.wait(5000));
+    // Should report KilledJobError (cancellation wins over FallbackRequired)
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // Payload should be removed because cancellation overrides FallbackRequired
+    // and there's no fallback consumer
+    QVERIFY(!QFileInfo::exists(tempPayloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIfArchiveFallback()
+{
+    // Test empty/corrupt archive after successful open with UncompressIfArchive
+    // Creates a .tar.gz file with invalid content - KTar opens it but finds 0 entries
+    // This exercises the "empty archive after open" path, NOT the "open failure" path
+    ScopedTempFile corruptArchive;
+    corruptArchive->setFileTemplate(QDir::tempPath() + "/corrupt_XXXXXX.tar.gz");
+    QVERIFY(corruptArchive.open());
+    corruptArchive->write("This looks like a tar but is corrupt");
+    corruptArchive->flush();
+    QString payloadFile = corruptArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // Should fail with ExtractionFailed (archive opens but copyTo fails - empty/corrupt)
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testEmptyCorruptArchiveAfterOpenUncompressIntoSubdirIfArchiveFallback()
+{
+    // Test empty/corrupt archive after successful open with UncompressIntoSubdirIfArchive
+    // Creates a .tar.gz file with invalid content - KTar opens it but finds 0 entries
+    // This exercises the "empty archive after open" path, NOT the "open failure" path
+    ScopedTempFile corruptArchive;
+    corruptArchive->setFileTemplate(QDir::tempPath() + "/corrupt_XXXXXX.tar.gz");
+    QVERIFY(corruptArchive.open());
+    corruptArchive->write("This looks like a tar but is corrupt");
+    corruptArchive->flush();
+    QString payloadFile = corruptArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // Should fail with ExtractionFailed (archive opens but copyTo fails)
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testUnknownMimeAlwaysUncompressError()
+{
+    // Test unknown MIME type with AlwaysUncompress - should error, payload removed
+    ScopedTempFile unknownFile;
+    QVERIFY(unknownFile.open());
+    unknownFile->write("This is not a recognized archive format");
+    unknownFile->flush();
+    QString payloadFile = unknownFile.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::AlwaysUncompress);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    // Should error
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Payload should be removed on ExtractionFailed
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testDestructionBeforeThreadStart()
+{
+    // Test destruction before thread starts (kill before start)
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->kill(); // Kill before start
+
+    // Job should be destroyed without starting thread
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+
+    // Payload should be removed (cleanup in kill path before start)
+    QVERIFY(!QFileInfo::exists(payloadFile));
+}
+
+void ArchiveExtractionJobTest::testDestructionAfterThreadStartBeforeWorkerExecution()
+{
+    // Test destruction after thread start but before worker executes doWork()
+    // Uses barrier to deterministically block worker at startup checkpoint
+    // Verifies that destruction propagates cancellation and worker result is Cancelled
+    auto barrier = makeSemaphore();
+    auto workerStartedSem = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the barrier after started() is emitted
+    job->setTestBarrierAfterStarted(barrier);
+
+    // Set callback to be notified when worker emits started()
+    job->setTestWorkerStartedCallback([workerStartedSem]() {
+        workerStartedSem->release();
+    });
+
+    // Capture worker's terminal result via test-only callback using lifetime-safe TestState
+    TestState<ArchiveExtractionWorker::ResultType> observedWorkerResult(ArchiveExtractionWorker::Success);
+    job->setTestWorkerResultCallback([observedWorkerResult](ArchiveExtractionWorker::ResultType result) mutable {
+        observedWorkerResult.store(result);
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy resultSpy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to emit started() and block at barrier
+    // This proves thread has started and worker reached first checkpoint
+    QVERIFY(tryAcquire(workerStartedSem, 5000));
+
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 1);
+
+    // Destroy job while worker is blocked at startup - manager retains ownership
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+
+    // Release barrier to allow worker to proceed and finish
+    release(barrier);
+
+    // Give time for worker to finish and manager to clean up
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(10000));
+
+    // Verify worker's actual terminal result was Cancelled (not Success)
+    // This proves destruction propagated cancellation, not that extraction succeeded
+    QCOMPARE(observedWorkerResult.load(), ArchiveExtractionWorker::Cancelled);
+
+    // Verify payload cleaned up (worker completed with Cancelled, which cleans up payload)
+    QVERIFY(!QFileInfo::exists(payloadFile));
+}
+
+void ArchiveExtractionJobTest::testCancellationWhileWorkerBlockedAtStartup()
+{
+    // Test cancellation while worker is blocked at the first checkpoint (after started())
+    // Uses UncompressIntoSubdir (not IfArchive) to exercise a different code path
+    // where MIME type is not checked for archive detection
+    auto barrier = makeSemaphore();
+    auto workerStarted = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdir);
+    job->setTestBarrierAfterStarted(barrier);
+    job->setTestWorkerStartedCallback([workerStarted]() {
+        workerStarted->release();
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy resultSpy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to start and block at barrier
+    QVERIFY(tryAcquire(workerStarted, 5000));
+
+    // Worker is now blocked at the first checkpoint (after started()).
+    // Request cancellation.
+    job->kill();
+
+    // Release barrier to allow worker to proceed
+    release(barrier);
+
+    // Worker should check cancellation at next checkpoint and emit Cancelled
+    QVERIFY(resultSpy.wait(15000));
+    QVERIFY(job->error() == KJob::KilledJobError);
+
+    // Payload should be removed on cancellation
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testManagerMediatedCancellation()
+{
+    // Test manager-mediated cancellation via ArchiveExtractionManager::requestCancellation()
+    // without calling job->kill() and without destroying the job.
+    // This verifies the manager's atomic cancellation store works independently of the
+    // queued interruption fallback. The test suppresses the fallback to isolate the atomic store.
+    auto barrier = makeSemaphore();
+    auto workerAtBarrierSem = makeSemaphore();
+    TestState<bool> preCopyToReached(false);
+
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    // Use a unique destination directory for this test
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo_testManagerMediatedCancellation/");
+    QDir().mkpath(installDir);
+    // Ensure destination is empty at start
+    QVERIFY(QDir(installDir).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+
+    // Configure worker to block at the barrier before copyTo
+    job->setTestBarrierBeforeCopyTo(barrier);
+
+    // Callback fires when worker reaches the barrier (before the new checkpoint)
+    job->setTestBeforeCopyToCallback([workerAtBarrierSem]() {
+        workerAtBarrierSem->release();
+    });
+
+    // Observation point: fires AFTER the pre-copyTo cancellation checkpoint but BEFORE copyTo()
+    // If this fires, the checkpoint was passed (cancellation not observed at checkpoint).
+    job->setTestPreCopyToCallback([preCopyToReached]() mutable {
+        preCopyToReached.store(true);
+    });
+
+    // Capture worker's terminal result via test-only callback
+    TestState<ArchiveExtractionWorker::ResultType> observedWorkerResult(ArchiveExtractionWorker::Success);
+    job->setTestWorkerResultCallback([observedWorkerResult](ArchiveExtractionWorker::ResultType result) mutable {
+        observedWorkerResult.store(result);
+    });
+
+    TestScope scope(job);
+    scope.addBarrier(barrier);
+
+    QSignalSpy resultSpy(job, &KJob::result);
+    job->start();
+
+    // Wait for worker to reach the barrier (proves: MIME checked, archive opened, mutex acquired, aboutToCopyTo emitted)
+    QVERIFY(tryAcquire(workerAtBarrierSem, 5000));
+
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 1);
+
+    // Suppress the queued interruption fallback to isolate the atomic cancellation store
+    // This is the key test seam: with this suppressed, ONLY the atomic store can cancel the worker
+    ArchiveExtractionManager::instance().setTestSuppressInterruptionFallback(handle, true);
+
+    // Request cancellation DIRECTLY via manager, NOT via job->kill()
+    // This tests the manager's cancellation API in isolation
+    ArchiveExtractionManager::instance().requestCancellation(handle);
+
+    // Release barrier to allow worker to proceed
+    // Worker will hit the cancellation checkpoint after barrier and before copyTo()
+    // With interruption fallback suppressed, ONLY the atomic flag can trigger cancellation
+    release(barrier);
+
+    QVERIFY(resultSpy.wait(5000));
+
+    // Should report KilledJobError via manager-mediated cancellation
+    QVERIFY(job->error() == KJob::KilledJobError);
+    QVERIFY(job->errorText().contains("cancelled", Qt::CaseInsensitive));
+
+    // Verify worker's actual terminal result was Cancelled
+    QCOMPARE(observedWorkerResult.load(), ArchiveExtractionWorker::Cancelled);
+
+    // The pre-copyTo observation point must NOT have been reached - proves the atomic checkpoint caught cancellation
+    QVERIFY(!preCopyToReached.load());
+
+    // Payload should be removed on Cancelled
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    // Destination must remain empty - no partial extraction occurred
+    QVERIFY(QDir(installDir).entryList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot).isEmpty());
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testMultipleConcurrentJobs()
+{
+    // Test multiple concurrent jobs - entries remain independent and are each cleaned exactly once
+    // Ensure clean state from previous tests
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 0);
+
+    const int numJobs = 4;
+    std::vector<ArchiveExtractionJob*> jobs;
+    std::vector<std::unique_ptr<QSignalSpy>> spies;
+    std::vector<QString> payloadFiles;
+    std::vector<int> handles;
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    // Use ScopedTempFile for deterministic ownership - declare BEFORE jobParent
+    // so tempArchives is destroyed AFTER jobParent (reverse order of declaration)
+    std::vector<ScopedTempFile> tempArchives;
+    tempArchives.reserve(numJobs);
+
+// Parent object for automatic job cleanup
+    QObject jobParent;
+
+    std::vector<std::unique_ptr<TestScope>> scopes;
+    scopes.reserve(numJobs);
+
+    // Create jobs with both shared and distinct destinations
+    for (int i = 0; i < numJobs; ++i) {
+        tempArchives.emplace_back();
+        QVERIFY(tempArchives[i].open());
+        QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+        QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+        tempArchives[i]->write(sourceArchive.readAll());
+        tempArchives[i]->flush();
+        sourceArchive.close();
+        QString payloadFile = tempArchives[i].fileName();
+        payloadFiles.push_back(payloadFile);
+
+        // Alternate between same destination and distinct destinations
+        QString jobInstallDir = installDir;
+        if (i % 2 == 1) {
+            jobInstallDir = installDir + QStringLiteral("subdir%1/").arg(i);
+            QDir().mkpath(jobInstallDir);
+        }
+
+ ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, jobInstallDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive, &jobParent);
+         job->setAutoDelete(false);
+         auto spy = std::make_unique<QSignalSpy>(job, &KJob::result);
+         jobs.push_back(job);
+         spies.push_back(std::move(spy));
+
+        // Set up scope guard for each job
+        scopes.emplace_back(std::make_unique<TestScope>(job));
+    }
+
+    // Start all jobs
+    for (int i = 0; i < numJobs; ++i) {
+        jobs[i]->start();
+    }
+
+    // Collect handles
+    for (int i = 0; i < numJobs; ++i) {
+        int handle = jobs[i]->extractionHandle();
+        QVERIFY(handle != -1);
+        handles.push_back(handle);
+    }
+
+    // Verify all entries are active
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), numJobs);
+
+    // Wait for all jobs to complete - use collective event-driven wait to avoid
+    // race where a job finishes before its individual wait() begins.
+    QElapsedTimer waitTimer;
+    waitTimer.start();
+    const int waitTimeout = 30000;
+    while (true) {
+        bool allDone = true;
+        for (int i = 0; i < numJobs; ++i) {
+            if (spies[i]->count() < 1) {
+                allDone = false;
+                break;
+            }
+        }
+        if (allDone) {
+            break;
+        }
+        if (waitTimer.elapsed() >= waitTimeout) {
+            // Report which jobs didn't complete
+            for (int i = 0; i < numJobs; ++i) {
+                if (spies[i]->count() < 1) {
+                    QFAIL(qPrintable(QString("Job %1 did not complete within timeout").arg(i)));
+                }
+            }
+            break;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
+
+    // Verify all jobs completed exactly once
+    for (int i = 0; i < numJobs; ++i) {
+        QCOMPARE(spies[i]->count(), 1);
+        QVERIFY(!jobs[i]->error());
+    }
+
+    // Manager entry count should return to zero
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(30000));
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 0);
+
+    // All payloads should be cleaned up
+    for (const QString &pf : payloadFiles) {
+        QVERIFY(!QFileInfo::exists(pf));
+    }
+
+    // Scopes automatically handle cleanup - jobs are deleted via jobParent,
+    // spies are auto-deleted via unique_ptr, tempArchives destroyed after jobParent
+}
+
+void ArchiveExtractionJobTest::testThreadCreationFailure()
+{
+    // Simulate a failed native thread start. No worker is created or moved;
+    // the manager reports a synthetic terminal extraction failure.
+    ArchiveExtractionManager::instance().setTestForceStartFailure(true);
+
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->setAutoDelete(false);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QTRY_VERIFY_WITH_TIMEOUT(spy.count() >= 1, 5000);
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // No active extractions remain: the synthetic failure finalized the entry.
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 0);
+
+    // Reset the seam for subsequent tests.
+    ArchiveExtractionManager::instance().setTestForceStartFailure(false);
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testDeadJobFallbackPayloadCleanup()
+{
+    // Worker genuinely produces FallbackRequired; job is destroyed after result
+    // delivery but before the entry is finalized. The manager must remove the
+    // unconsumed payload once the thread is reaped. Cancellation flag is never
+    // reset.
+    ScopedTempFile tempFile;
+    tempFile->setAutoRemove(false);
+    QVERIFY(tempFile.open());
+    tempFile->write("test payload content for dead job fallback cleanup");
+    tempFile->flush();
+    tempFile->close();
+    QString payloadFile = tempFile.fileName();
+    tempFile->setAutoRemove(true);
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + QLatin1String("/demo/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir, ArchiveExtractionJob::UncompressIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    // Job is destroyed after FallbackRequired was produced and delivered.
+    job->deleteLater();
+    QSignalSpy destroyedSpy(job, &QObject::destroyed);
+    QVERIFY(destroyedSpy.wait(5000));
+
+    // The destroyed signal fires via DirectConnection, which posts a queued
+    // invokeMethod to set jobDead and clean up the payload. Use QTRY_VERIFY
+    // to wait for that queued callback to run.
+    QTRY_VERIFY(!QFileInfo::exists(payloadFile));
+    QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+}
+
+void ArchiveExtractionJobTest::testCompletedEntryReleased()
+{
+    // C1: Verify that completed entries are released from the manager even
+    // while the job is still alive. Use testTotalEntryCount() as the oracle
+    // (not activeExtractionsCount(), which ignores Done entries).
+
+    // Process any queued destroyed callbacks left over from previous tests,
+    // since waitForAllFinished() returns true once no entries are active
+    // (non-Done), even if Done entries still await release.
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+    QCOMPARE(ArchiveExtractionManager::instance().testTotalEntryCount(), 0);
+
+    for (int i = 0; i < 3; ++i) {
+        ScopedTempFile tempArchive;
+        QVERIFY(tempArchive.open());
+        QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+        QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+        tempArchive->write(sourceArchive.readAll());
+        tempArchive->flush();
+        sourceArchive.close();
+        QString payloadFile = tempArchive.fileName();
+
+        QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                             + QStringLiteral("/demo_testCompletedEntryReleased%1/").arg(i);
+        QDir().mkpath(installDir);
+
+        ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                             ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+        QSignalSpy spy(job, &KJob::result);
+        job->start();
+
+        QVERIFY(spy.wait(5000));
+        QVERIFY(!job->error());
+
+        int handle = job->extractionHandle();
+        QVERIFY(handle != -1);
+
+        // Entry should still be in the vector while the job is alive.
+        QCOMPARE(ArchiveExtractionManager::instance().testTotalEntryCount(), 1);
+
+        job->deleteLater();
+        QPointer<ArchiveExtractionJob> jobPtr(job);
+        QTRY_VERIFY(jobPtr.isNull());
+
+        // Process events so the queued destroyed callback can release the entry.
+        QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+
+        QVERIFY(!QFileInfo::exists(payloadFile));
+    }
+
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 200);
+    QCOMPARE(ArchiveExtractionManager::instance().testTotalEntryCount(), 0);
+}
+
+void ArchiveExtractionJobTest::testStartupFailurePayloadAndEntryCleanup()
+{
+    // C2: Startup failure must clean up the payload and release the entry,
+    // even though no worker was ever started. The payload must not leak.
+    ArchiveExtractionManager::instance().setTestForceStartFailure(true);
+    // RAII-style reset: ensure the seam is turned off even if the test fails.
+    struct SeamResetter {
+        ~SeamResetter() { ArchiveExtractionManager::instance().setTestForceStartFailure(false); }
+    } seamResetter;
+    Q_UNUSED(seamResetter);
+
+    // Use a real temporary payload that is NOT auto-deleted, so we can verify
+    // the implementation removes it (not just the fixture).
+    QTemporaryFile tempFile(QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                            + QStringLiteral("/startup_fail_XXXXXX"));
+    tempFile.setAutoRemove(false);
+    QVERIFY(tempFile.open());
+    tempFile.write("startup failure test payload");
+    tempFile.flush();
+    tempFile.close();
+    QString payloadFile = tempFile.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                         + QStringLiteral("/demo_testStartupFailure/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                         ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->setAutoDelete(false);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QTRY_VERIFY_WITH_TIMEOUT(spy.count() >= 1, 5000);
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Exactly one failure result delivered.
+    QCOMPARE(spy.count(), 1);
+
+    // Payload removed by the implementation (no worker existed to consume it).
+    QVERIFY(!QFileInfo::exists(payloadFile));
+
+    // Entry released.
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+
+void ArchiveExtractionJobTest::testStartupFailurePayloadRemoveFailureRetry()
+{
+    // C2: When payload removal fails during startup failure, the manager must
+    // retain the entry and retry cleanup until the payload is removed, then
+    // release the entry. No payload leak, no premature entry release.
+    ArchiveExtractionManager::instance().setTestForceStartFailure(true);
+    ArchiveExtractionManager::instance().setTestPayloadRemoveFailure(true);
+    // RAII-style reset: ensure both seams are turned off even if the test fails.
+    struct SeamResetter {
+        ~SeamResetter() {
+            ArchiveExtractionManager::instance().setTestPayloadRemoveFailure(false);
+            ArchiveExtractionManager::instance().setTestForceStartFailure(false);
+        }
+    } seamResetter;
+    Q_UNUSED(seamResetter);
+
+    // Use a real temporary payload that is NOT auto-deleted, so we can verify
+    // the implementation removes it (not just the fixture).
+    QTemporaryFile tempFile(QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+                            + QStringLiteral("/startup_fail_retry_XXXXXX"));
+    tempFile.setAutoRemove(false);
+    QVERIFY(tempFile.open());
+    tempFile.write("startup failure retry test payload");
+    tempFile.flush();
+    tempFile.close();
+    QString payloadFile = tempFile.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                         + QStringLiteral("/demo_testStartupFailureRetry/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                         ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->setAutoDelete(false);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QTRY_VERIFY_WITH_TIMEOUT(spy.count() >= 1, 5000);
+    QVERIFY(job->error());
+    QCOMPARE(job->error(), KJob::UserDefinedError);
+    QVERIFY(!job->errorString().isEmpty());
+
+    // Exactly one failure result delivered.
+    QCOMPARE(spy.count(), 1);
+
+    // Payload still exists: removal was simulated as failed, so it must NOT
+    // have been removed by the implementation.
+    QVERIFY(QFileInfo::exists(payloadFile));
+
+    // Entry retained: payload cleanup is pending, so the entry must NOT be
+    // released from the manager's tracking vector.
+    QVERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 1);
+
+    // Now disable the failure seam and allow the retry to succeed.
+    ArchiveExtractionManager::instance().setTestPayloadRemoveFailure(false);
+
+    // The retry timer fires every 15ms; wait for the payload to be removed
+    // and the entry to be released.
+    QTRY_VERIFY(!QFileInfo::exists(payloadFile));
+    QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+}
+void ArchiveExtractionJobTest::testJobDestructionBeforeResultDelivery()
+{
+    // C1/C4: Job destroyed before the worker produces a result. The manager
+    // must not crash or access freed memory, and the entry must be released.
+    auto barrier = makeSemaphore();
+    auto workerStartedSem = makeSemaphore();
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                         + QStringLiteral("/demo_testJobDestructionBeforeResult/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                         ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->setTestBarrierAfterStarted(barrier);
+    job->setTestWorkerStartedCallback([workerStartedSem]() { workerStartedSem->release(); });
+
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(tryAcquire(workerStartedSem, 5000));
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+    QCOMPARE(ArchiveExtractionManager::instance().activeExtractionsCount(), 1);
+
+    // Destroy the job while the worker is blocked at the barrier (before result).
+    job->deleteLater();
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+    QTRY_VERIFY(jobPtr.isNull());
+
+    // Release the barrier so the worker can finish (it will see cancellation).
+    release(barrier);
+
+    // Manager should release the entry once the thread finishes.
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(10000));
+    QCOMPARE(ArchiveExtractionManager::instance().testTotalEntryCount(), 0);
+}
+
+void ArchiveExtractionJobTest::testJobDestructionAfterResultDelivery()
+{
+    // C1: Job destroyed after result delivery but before entry finalization.
+    // The entry must be released once the job is destroyed.
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                         + QStringLiteral("/demo_testJobDestructionAfterResult/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                         ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    QSignalSpy spy(job, &KJob::result);
+    job->start();
+
+    QVERIFY(spy.wait(5000));
+    QVERIFY(!job->error());
+
+    int handle = job->extractionHandle();
+    QVERIFY(handle != -1);
+    QCOMPARE(ArchiveExtractionManager::instance().testTotalEntryCount(), 1);
+
+    // Destroy the job after result delivery.
+    job->deleteLater();
+    QSignalSpy destroyedSpy(job, &QObject::destroyed);
+    QVERIFY(destroyedSpy.wait(5000));
+
+    // The destroyed signal fires via DirectConnection, which posts a queued
+    // invokeMethod to set jobDead and release the entry. Use QTRY_VERIFY to
+    // wait for that queued callback to run.
+    QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+
+    QVERIFY(!QFileInfo::exists(payloadFile));
+}
+
+void ArchiveExtractionJobTest::testSyntheticFailureSynchronousJobDestruction()
+{
+    // C4: Prove that the synthetic-failure path cannot use the job after a
+    // synchronous result handler destroys it. The job must have a valid
+    // handle/state before the result callback runs, and startExtraction()
+    // must return safely even if the job is destroyed during result delivery.
+    ArchiveExtractionManager::instance().setTestForceStartFailure(true);
+    // RAII-style reset: ensure the seam is turned off even if the test fails.
+    struct SeamResetter {
+        ~SeamResetter() { ArchiveExtractionManager::instance().setTestForceStartFailure(false); }
+    } seamResetter;
+    Q_UNUSED(seamResetter);
+
+    bool handlerRanDuringStartExtraction = false;
+    bool resultReceived = false;
+    int jobErrorCode = -1;
+
+    ScopedTempFile tempArchive;
+    QVERIFY(tempArchive.open());
+    QFile sourceArchive(dataDir + QStringLiteral("archive_dir.tar.gz"));
+    QVERIFY(sourceArchive.open(QIODevice::ReadOnly));
+    tempArchive->write(sourceArchive.readAll());
+    tempArchive->flush();
+    sourceArchive.close();
+    QString payloadFile = tempArchive.fileName();
+
+    QString installDir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+                         + QStringLiteral("/demo_testSyntheticFailureSync/");
+    QDir().mkpath(installDir);
+
+    ArchiveExtractionJob *job = new ArchiveExtractionJob(payloadFile, installDir,
+                                                         ArchiveExtractionJob::UncompressIntoSubdirIfArchive);
+    job->setAutoDelete(false);
+    QPointer<ArchiveExtractionJob> jobPtr(job);
+
+    // Connect a result handler that destroys the job via deleteLater() during
+    // synchronous result delivery. The lambda sets handlerRanDuringStartExtraction
+    // to prove the handler ran while startExtraction() was still executing
+    // (i.e., before it returned to ArchiveExtractionJob::start()).
+    QObject::connect(job, &KJob::result, job, [&handlerRanDuringStartExtraction,
+                                                &resultReceived, &jobErrorCode,
+                                                job](KJob *finishedJob) {
+        Q_UNUSED(finishedJob);
+        resultReceived = true;
+        QVERIFY(job != nullptr);  // Same job object
+        QVERIFY(job->extractionHandle() != -1);  // Handle valid before result
+        jobErrorCode = job->error();
+        handlerRanDuringStartExtraction = true;
+        job->deleteLater();
+    });
+
+    // startExtraction() may synchronously emit a result, which runs the handler
+    // above. The handler calls deleteLater() before startExtraction() returns.
+    // After start() returns, d must not be accessed (C4 fix). Do NOT access job
+    // here: the job may have been destroyed via deleteLater() during
+    // startExtraction().
+    job->start();
+
+    // The result handler ran synchronously during startExtraction().
+    QVERIFY(resultReceived);
+    QVERIFY(handlerRanDuringStartExtraction);
+    QCOMPARE(jobErrorCode, KJob::UserDefinedError);
+
+    // Process events to let deleteLater() complete destruction.
+    QTRY_VERIFY(jobPtr.isNull());  // Job was destroyed
+
+    // Entry should be released (job was destroyed, tryFinalize removed it).
+    QVERIFY(ArchiveExtractionManager::instance().waitForAllFinished(5000));
+    QTRY_VERIFY(ArchiveExtractionManager::instance().testTotalEntryCount() == 0);
+
+    // Payload removed by implementation (no worker was created).
+    QVERIFY(!QFileInfo::exists(payloadFile));
+}
+
+QTEST_MAIN(ArchiveExtractionJobTest)
+
+#include "archiveextractionjobtest.moc"
+-------------------------------------------------------------------------------
+PART B: git diff HEAD -- autotests/core/CMakeLists.txt  (COMPLETE, UNOMITTED)
+-------------------------------------------------------------------------------
+
+diff --git a/autotests/core/CMakeLists.txt b/autotests/core/CMakeLists.txt
+index 005c14c8..377ce504 100644
+--- a/autotests/core/CMakeLists.txt
++++ b/autotests/core/CMakeLists.txt
+@@ -8,6 +8,9 @@ if (WIN32)
+ else()
+     set(DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data/")
+ endif()
++configure_file(data/archive_dir.tar.gz data/archive_dir.tar.gz COPYONLY)
++configure_file(data/archive_toplevel_files.tar.gz data/archive_toplevel_files.tar.gz COPYONLY)
++configure_file(data/testfile.txt data/testfile.txt COPYONLY)
+ configure_file(data/entry.xml.in data/entry.xml)
+ configure_file(data/provider.xml.in data/provider.xml)
+ configure_file(data/enginetest.knsrc.in data/enginetest.knsrc)
+@@ -17,6 +20,7 @@ knewstuff_unit_tests(
+     knewstuffauthortest.cpp
+     knewstuffenginetest.cpp
+     installationtest.cpp
++    archiveextractionjobtest.cpp
+ )
+ 
+ if(LINUX) # fails on freebsd for unknown reasons
+@@ -26,3 +30,4 @@ endif()
+ target_link_libraries(knewstuffenginetest knewstuff_qml_STATIC)
+ 
+ set_tests_properties(knewstuff-installationtest PROPERTIES ENVIRONMENT "LANG=C")
++set_tests_properties(knewstuff-archiveextractionjobtest PROPERTIES TIMEOUT 120)
+
+-------------------------------------------------------------------------------
+PART C: git diff HEAD -- src/core/CMakeLists.txt  (COMPLETE, UNOMITTED)
+-------------------------------------------------------------------------------
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index f94f1781..8fe9a3fa 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -9,6 +9,7 @@ set(KNewStuffCore_SRCS
+     cache.cpp
+     enginebase.cpp
+     entry.cpp
++    filesystemmutex.cpp
+     imageloader.cpp
+     installation.cpp
+     itemsmodel.cpp
+@@ -54,8 +55,11 @@ target_sources(knscore_jobs_static PRIVATE
+     jobs/filecopyworker.cpp
+     jobs/httpjob.cpp
+     jobs/httpworker.cpp
++    jobs/archiveextractionjob.cpp
++    jobs/archiveextractionworker.cpp
++    jobs/archiveextractionmanager.cpp
+ )
+-target_link_libraries(knscore_jobs_static PUBLIC Qt6::Network KF6::I18n KF6::CoreAddons KF6::Package)
++target_link_libraries(knscore_jobs_static PUBLIC Qt6::Network KF6::I18n KF6::CoreAddons KF6::Package KF6::Archive)
+ target_include_directories(knscore_jobs_static PRIVATE ${CMAKE_BINARY_DIR})
+ # Needed to link this static lib to shared libs
+ set_property(TARGET knscore_jobs_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+-------------------------------------------------------------------------------
+PART D: CURRENT COMPLETE CONTENT OF autotests/core/CMakeLists.txt (%s lines)
+33
+-------------------------------------------------------------------------------
+
+# SPDX-FileCopyrightText: Alexander Lohnau <alexander.lohnau@gmx.de>
+# SPDX-License-Identifier: BSD-2-Clause
+
+remove_definitions(-DQT_NO_CAST_FROM_ASCII)
+
+if (WIN32)
+    set(DATA_DIR "/${CMAKE_CURRENT_BINARY_DIR}/data/")
+else()
+    set(DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data/")
+endif()
+configure_file(data/archive_dir.tar.gz data/archive_dir.tar.gz COPYONLY)
+configure_file(data/archive_toplevel_files.tar.gz data/archive_toplevel_files.tar.gz COPYONLY)
+configure_file(data/testfile.txt data/testfile.txt COPYONLY)
+configure_file(data/entry.xml.in data/entry.xml)
+configure_file(data/provider.xml.in data/provider.xml)
+configure_file(data/enginetest.knsrc.in data/enginetest.knsrc)
+configure_file(data/installationtest.knsrc.in data/installationtest.knsrc)
+
+knewstuff_unit_tests(
+    knewstuffauthortest.cpp
+    knewstuffenginetest.cpp
+    installationtest.cpp
+    archiveextractionjobtest.cpp
+)
+
+if(LINUX) # fails on freebsd for unknown reasons
+    knewstuff_unit_tests(atticaprovidertest.cpp)
+endif()
+
+target_link_libraries(knewstuffenginetest knewstuff_qml_STATIC)
+
+set_tests_properties(knewstuff-installationtest PROPERTIES ENVIRONMENT "LANG=C")
+set_tests_properties(knewstuff-archiveextractionjobtest PROPERTIES TIMEOUT 120)
+
+-------------------------------------------------------------------------------
+PART E: CURRENT COMPLETE CONTENT OF src/core/CMakeLists.txt (%s lines)
+182
+-------------------------------------------------------------------------------
+
+# SPDX-FileCopyrightText: KDE Contributors
+# SPDX-License-Identifier: BSD-2-Clause
+
+set(KNEWSTUFFCORE_INSTALL_INCLUDEDIR "${KDE_INSTALL_INCLUDEDIR_KF}/KNewStuffCore")
+
+set(KNewStuffCore_SRCS
+    author.cpp
+    commentsmodel.cpp
+    cache.cpp
+    enginebase.cpp
+    entry.cpp
+    filesystemmutex.cpp
+    imageloader.cpp
+    installation.cpp
+    itemsmodel.cpp
+    provider.cpp
+    providersmodel.cpp
+    tagsfilterchecker.cpp
+    xmlloader.cpp
+    errorcode.cpp
+    resultsstream.cpp
+    transaction.cpp
+
+    # A system by which queries can be passed to the user, and responses
+    # gathered, depending on implementation. See question.h for details.
+    question.cpp
+    questionmanager.cpp
+    questionlistener.cpp
+
+    providercore.cpp
+    providerbase.cpp
+    categorymetadata.cpp
+    searchrequest.cpp
+    searchpreset.cpp
+    cache2.cpp
+    providerbubblewrap.cpp
+
+    ../attica/atticaprovider.cpp
+    ../attica/atticarequester.cpp
+    ../staticxml/staticxmlprovider.cpp
+)
+if(KF6Syndication_FOUND)
+    set(KNewStuffCore_syndication_SRCS
+        ../opds/opdsprovider.cpp
+        )
+endif()
+
+add_library(knscore_jobs_static STATIC)
+target_sources(knscore_jobs_static PRIVATE
+    # A set of minimal KJob based classes, designed to replace the
+    # more powerful KIO based system in places where KIO is not available
+    # for one reason or another.
+    jobs/downloadjob.cpp
+    jobs/filecopyjob.cpp
+    jobs/filecopyworker.cpp
+    jobs/httpjob.cpp
+    jobs/httpworker.cpp
+    jobs/archiveextractionjob.cpp
+    jobs/archiveextractionworker.cpp
+    jobs/archiveextractionmanager.cpp
+)
+target_link_libraries(knscore_jobs_static PUBLIC Qt6::Network KF6::I18n KF6::CoreAddons KF6::Package KF6::Archive)
+target_include_directories(knscore_jobs_static PRIVATE ${CMAKE_BINARY_DIR})
+# Needed to link this static lib to shared libs
+set_property(TARGET knscore_jobs_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+ecm_qt_declare_logging_category(knscore_jobs_static
+    HEADER knewstuffcore_debug.h
+    IDENTIFIER KNEWSTUFFCORE
+    CATEGORY_NAME kf.newstuff.core
+    OLD_CATEGORY_NAMES org.kde.knewstuff.core
+    DESCRIPTION "knewstuff (Core Lib)"
+    EXPORT KNEWSTUFF
+)
+
+add_library(KF6NewStuffCore ${KNewStuffCore_SRCS} ${KNewStuffCore_syndication_SRCS})
+add_library(KF6::NewStuffCore ALIAS KF6NewStuffCore )
+
+set_target_properties(KF6NewStuffCore PROPERTIES
+   VERSION     ${KNEWSTUFF_VERSION}
+   SOVERSION   ${KNEWSTUFF_SOVERSION}
+   EXPORT_NAME NewStuffCore
+)
+
+ecm_generate_export_header(KF6NewStuffCore
+    EXPORT_FILE_NAME knewstuffcore_export.h
+    BASE_NAME KNewStuffCore
+    GROUP_BASE_NAME KF
+    VERSION ${KF_VERSION}
+    USE_VERSION_HEADER
+    VERSION_BASE_NAME KNewStuff
+    DEPRECATED_BASE_VERSION 0
+    EXCLUDE_DEPRECATED_BEFORE_AND_AT ${EXCLUDE_DEPRECATED_BEFORE_AND_AT}
+    DEPRECATION_VERSIONS 6.9
+)
+
+set(KNewStuffCore_BUILD_INCLUDE_DIRS
+    ${KNewStuff_BINARY_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_include_directories(KF6NewStuffCore
+    PUBLIC "$<BUILD_INTERFACE:${KNewStuffCore_BUILD_INCLUDE_DIRS}>"
+    INTERFACE
+        "$<INSTALL_INTERFACE:${KNEWSTUFFCORE_INSTALL_INCLUDEDIR}>"
+        "$<INSTALL_INTERFACE:${KDE_INSTALL_INCLUDEDIR_KF}/KNewStuff>" # module version header
+)
+
+target_link_libraries(KF6NewStuffCore
+  PUBLIC
+    KF6::Attica                # For interacting with ocs providers, public for uploaddialog slots
+    KF6::CoreAddons
+    Qt6::Gui                   # For QImage
+  PRIVATE
+    KF6::Archive               # For decompressing archives
+    KF6::I18n                  # For translations
+    KF6::ConfigCore
+    KF6::Package
+    Qt6::Xml
+    knscore_jobs_static
+)
+
+if(KF6Syndication_FOUND)
+    target_compile_definitions(KF6NewStuffCore PRIVATE -DSYNDICATION_FOUND="${KF6Syndication_FOUND}")
+    target_link_libraries(KF6NewStuffCore
+        PRIVATE
+        KF6::Syndication #OPDS
+    )
+endif()
+
+ecm_generate_headers(KNewStuffCore_CamelCase_HEADERS
+  HEADER_NAMES
+  Author
+  Cache
+  EngineBase
+  Entry
+  ErrorCode
+  ItemsModel
+  Provider
+  ProvidersModel
+  Question
+  QuestionListener
+  QuestionManager
+  ResultsStream
+  TagsFilterChecker
+  Transaction
+  SearchRequest
+  ProviderCore
+  CategoryMetadata
+  SearchPreset
+
+  SHARED_PREFIX KNSCore
+  REQUIRED_HEADERS KNewStuffCore_HEADERS
+)
+
+install(TARGETS KF6NewStuffCore EXPORT KF6NewStuffCoreTargets ${KF_INSTALL_TARGETS_DEFAULT_ARGS})
+
+install(
+    FILES
+        ${KNewStuffCore_CamelCase_HEADERS}
+        ${KNewStuffCore_HEADERS}
+        ${CMAKE_CURRENT_BINARY_DIR}/knewstuffcore_export.h
+    DESTINATION
+        ${KNEWSTUFFCORE_INSTALL_INCLUDEDIR}/KNSCore
+    COMPONENT Devel
+)
+
+ecm_generate_qdoc(KF6NewStuffCore knewstuffcore.qdocconf)
+
+ecm_add_installed_library_check(KF6NewStuffCore
+    PACKAGE_NAME "KF6NewStuffCore"
+    PACKAGE_TARGET_NAMESPACE "KF6::"
+)
+
+ecm_installed_library_check_include_strings(KF6NewStuffCore
+    HEADERS ${KNewStuffCore_CamelCase_HEADERS}
+    PREFIX KNSCore
+)
+
+ecm_installed_library_check_version_preprocessor_macros(KF6NewStuffCore
+    PREFIX KNEWSTUFF
+)
+
+-------------------------------------------------------------------------------
+PART F: untracked source files added by this change set (git status, not part of git diff HEAD)
+-------------------------------------------------------------------------------
+
+ M autotests/core/CMakeLists.txt
+ M autotests/core/installationtest.cpp
+ M src/core/CMakeLists.txt
+ M src/core/installation.cpp
+ M src/core/installation_p.h
+?? .LKEYug
+?? .RJnCXA
+?? .fGxsQW
+?? .kilo/
+?? .mHxPqX
+?? .wggnhr
+?? LIFECYCLE_PROPOSAL.md
+?? autotests/core/archiveextractionjobtest.cpp
+?? autotests/core/archiveextractionjobtest.cpp.bak
+?? knewstuff-audit-source.txt
+?? src/core/filesystemmutex.cpp
+?? src/core/filesystemmutex.h
+?? src/core/jobs/archiveextractionjob.cpp
+?? src/core/jobs/archiveextractionjob.h
+?? src/core/jobs/archiveextractionmanager.cpp
+?? src/core/jobs/archiveextractionmanager.h
+?? src/core/jobs/archiveextractionworker.cpp
+?? src/core/jobs/archiveextractionworker.h
+?? src/qtquick/.qmlls.ini
+?? src/qtquick/private/.qmlls.ini
+
+END OF REVIEW BUNDLE 4

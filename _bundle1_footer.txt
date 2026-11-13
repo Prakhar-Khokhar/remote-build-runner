@@ -1,0 +1,7 @@
+
+-------------------------------------------------------------------------------
+SECTION D: git diff --check (whitespace/conflict marker check)
+-------------------------------------------------------------------------------
+git diff --check exit code: 0
+
+END OF REVIEW BUNDLE 1

@@ -1,0 +1,9 @@
+Test project /home/prakhar/Github Projects/knewstuff/build
+    Start 5: knewstuff-installationtest
+1/2 Test #5: knewstuff-installationtest ...........   Passed    2.38 sec
+    Start 6: knewstuff-archiveextractionjobtest
+2/2 Test #6: knewstuff-archiveextractionjobtest ...   Passed    0.56 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   2.99 sec

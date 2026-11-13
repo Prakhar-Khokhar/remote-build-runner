@@ -1,0 +1,420 @@
+================================================================================
+KNEWSTUFF PASS 2B.1 — REVIEW BUNDLE FILE 2 OF 6
+================================================================================
+Repository: /home/prakhar/Github Projects/knewstuff
+Branch: fix/install-freeze
+HEAD: cfaf92bbc888d2bfdbed97f06330c4f534eae1f7
+
+This file contains the complete current contents of:
+  - src/core/jobs/archiveextractionjob.cpp
+  - src/core/jobs/archiveextractionjob.h
+
+These are untracked files introduced/modified during Pass 2B.1.
+================================================================================
+
+================================================================================
+FILE 2A — src/core/jobs/archiveextractionjob.h (COMPLETE)
+================================================================================
+
+#ifndef ARCHIVEEXTRACTIONJOB_H
+#define ARCHIVEEXTRACTIONJOB_H
+
+#include "jobbase.h"
+#include "archiveextractionworker.h"
+
+#include <QStringList>
+#include <QPointer>
+#include <QSemaphore>
+#include <memory>
+#include <atomic>
+#include <functional>
+
+class KArchiveDirectory;
+
+namespace KNSCore
+{
+    class ArchiveExtractionWorker;
+    class ArchiveExtractionJobPrivate;
+    class ArchiveExtractionManager;
+    class ArchiveExtractionJob : public KJob
+    {
+        Q_OBJECT
+    public:
+        enum UncompressionOption {
+            AlwaysUncompress,
+            UncompressIfArchive,
+            UncompressIntoSubdirIfArchive,
+            UncompressIntoSubdir,
+            NeverUncompress,
+        };
+        Q_ENUM(UncompressionOption)
+
+        explicit ArchiveExtractionJob(const QString &payloadFile, const QString &installDir, UncompressionOption uncompressionOption, QObject *parent = nullptr);
+        ~ArchiveExtractionJob() override;
+
+        void start() override;
+
+        QStringList installedFiles() const;
+
+        // Test-only accessors
+        int extractionHandle() const;
+
+        // Test-only configuration
+        void setTestBarrierAfterStarted(std::shared_ptr<QSemaphore> barrier);
+        void setTestBarrierBeforeCopyTo(std::shared_ptr<QSemaphore> barrier);
+        void setTestBarrierBeforeCancellationCheck(std::shared_ptr<QSemaphore> barrier);
+        void setTestWorkerStartedCallback(std::function<void()> callback);
+        void setTestBeforeCopyToCallback(std::function<void()> callback);
+        void setTestBeforeCancellationCheckCallback(std::function<void()> callback);
+        void setTestAboutToCopyToCallback(std::function<void()> callback);
+        void setTestPreCopyToCallback(std::function<void()> callback);
+        // Test-only: callback invoked with worker's terminal ResultType when manager processes worker finish
+        void setTestWorkerResultCallback(std::function<void(ArchiveExtractionWorker::ResultType)> callback);
+
+        // Set the standard resource directory (e.g., "wallpaper") for special fallback behavior
+        void setStandardResourceDirectory(const QString &resourceDir);
+        const QString &standardResourceDirectory() const;
+        const std::function<void()>& testWorkerStartedCallback() const;
+        const std::function<void()>& testBeforeCopyToCallback() const;
+        const std::function<void()>& testBeforeCancellationCheckCallback() const;
+        const std::function<void()>& testAboutToCopyToCallback() const;
+        const std::function<void()>& testPreCopyToCallback() const;
+        const std::function<void(ArchiveExtractionWorker::ResultType)>& testWorkerResultCallback() const;
+        std::shared_ptr<QSemaphore> testBarrierAfterStarted() const;
+        std::shared_ptr<QSemaphore> testBarrierBeforeCopyTo() const;
+        std::shared_ptr<QSemaphore> testBarrierBeforeCancellationCheck() const;
+
+        // Manager-invoked result handling (called from ArchiveExtractionManager)
+        void handleSuccess(const QStringList &files);
+        void handleFallbackRequired();
+        void handleExtractionFailed(const QString &errorMessage);
+        void handleCancelled();
+
+        // Manager access to shared cancellation flag
+        std::shared_ptr<std::atomic<bool>> cancellationFlag() const;
+
+        // Set the extraction handle assigned by the manager. Called before any
+        // result delivery so that the job has a valid, consistent handle/state
+        // before any result callback can run (see C4).
+        void setExtractionHandle(int handle);
+
+    protected:
+        bool doKill() override;
+
+    private:
+        friend class ArchiveExtractionManager;
+        const std::unique_ptr<ArchiveExtractionJobPrivate> d;
+    };
+}
+#endif // ARCHIVEEXTRACTIONJOB_H
+
+================================================================================
+FILE 2B — src/core/jobs/archiveextractionjob.cpp (COMPLETE)
+================================================================================
+
+/*
+    SPDX-FileCopyrightText: 2024 KDE Contributors
+    SPDX-License-Identifier: LGPL-2.1-or-later
+*/
+
+#include "archiveextractionjob.h"
+
+#include "archiveextractionmanager.h"
+#include "archiveextractionworker.h"
+
+#include "knewstuffcore_debug.h"
+
+#include <QThread>
+#include <QVariant>
+#include <QFile>
+#include <KLocalizedString>
+
+using namespace KNSCore;
+
+class KNSCore::ArchiveExtractionJobPrivate
+{
+public:
+    QString payloadFile;
+    QString installDir;
+    ArchiveExtractionJob::UncompressionOption uncompressionOption = ArchiveExtractionJob::NeverUncompress;
+
+    QStringList installedFiles;
+    bool finished = false;
+    bool killRequested = false;
+    bool startCalled = false;
+    int extractionHandle = -1;
+
+    // Test-only: allow setting test mode on worker before start()
+    std::shared_ptr<QSemaphore> testBarrierAfterStarted;
+    std::shared_ptr<QSemaphore> testBarrierBeforeCopyTo;
+    std::shared_ptr<QSemaphore> testBarrierBeforeCancellationCheck;
+    std::function<void()> testWorkerStartedCallback;
+    std::function<void()> testBeforeCopyToCallback;
+    std::function<void()> testBeforeCancellationCheckCallback;
+    std::function<void()> testAboutToCopyToCallback;
+    std::function<void()> testPreCopyToCallback;
+    std::function<void(ArchiveExtractionWorker::ResultType)> testWorkerResultCallback;
+
+    // Standard resource directory (e.g., "wallpaper") for special fallback behavior
+    QString standardResourceDirectory;
+
+    // Cancellation flag shared with manager entry
+    std::shared_ptr<std::atomic<bool>> cancellation;
+};
+
+ArchiveExtractionJob::ArchiveExtractionJob(const QString &payloadFile, const QString &installDir, UncompressionOption uncompressionOption, QObject *parent)
+    : KJob(parent)
+    , d(new ArchiveExtractionJobPrivate)
+{
+    d->payloadFile = payloadFile;
+    d->installDir = installDir;
+    d->uncompressionOption = uncompressionOption;
+    d->cancellation = std::make_shared<std::atomic<bool>>(false);
+}
+
+ArchiveExtractionJob::~ArchiveExtractionJob()
+{
+    // If kill was requested but start was never called, clean up the payload
+    if (d->killRequested && !d->startCalled) {
+        QFile::remove(d->payloadFile);
+    }
+
+    // If the job hasn't finished yet (destroyed while worker is running),
+    // request cancellation. If the job already finished, the manager has
+    // already cleaned up via QThread::finished → reapEntry.
+    if (d->extractionHandle != -1 && !d->finished) {
+        d->cancellation->store(true, std::memory_order_release);
+        ArchiveExtractionManager::instance().requestCancellation(d->extractionHandle);
+    }
+}
+
+void ArchiveExtractionJob::start()
+{
+    if (d->startCalled) {
+        return;
+    }
+    d->startCalled = true;
+
+    // If kill was requested before start, finish immediately with KilledJobError
+    // and clean up the payload since no worker will be created to handle it.
+    if (d->killRequested) {
+        QFile::remove(d->payloadFile);
+        if (!error()) {
+            setError(KJob::KilledJobError);
+            setErrorText(i18n("Archive extraction was cancelled"));
+            emitResult();
+        } else if (error() == KJob::KilledJobError && errorText().isEmpty()) {
+            setErrorText(i18n("Archive extraction was cancelled"));
+        }
+        return;
+    }
+
+    // Start extraction through the manager. The manager assigns the extraction
+    // handle via setExtractionHandle() before any result delivery. We must not
+    // access d after this call returns: a synchronous result handler may have
+    // destroyed the job, freeing d.
+    ArchiveExtractionManager::instance().startExtraction(
+        d->payloadFile, d->installDir, d->uncompressionOption, this);
+}
+
+QStringList ArchiveExtractionJob::installedFiles() const
+{
+    return d->installedFiles;
+}
+
+int ArchiveExtractionJob::extractionHandle() const
+{
+    return d->extractionHandle;
+}
+
+void ArchiveExtractionJob::setTestBarrierAfterStarted(std::shared_ptr<QSemaphore> barrier)
+{
+    d->testBarrierAfterStarted = std::move(barrier);
+}
+
+std::shared_ptr<QSemaphore> ArchiveExtractionJob::testBarrierAfterStarted() const
+{
+    return d->testBarrierAfterStarted;
+}
+
+std::shared_ptr<QSemaphore> ArchiveExtractionJob::testBarrierBeforeCopyTo() const
+{
+    return d->testBarrierBeforeCopyTo;
+}
+
+void ArchiveExtractionJob::setTestBarrierBeforeCopyTo(std::shared_ptr<QSemaphore> barrier)
+{
+    d->testBarrierBeforeCopyTo = std::move(barrier);
+}
+
+std::shared_ptr<QSemaphore> ArchiveExtractionJob::testBarrierBeforeCancellationCheck() const
+{
+    return d->testBarrierBeforeCancellationCheck;
+}
+
+void ArchiveExtractionJob::setTestBarrierBeforeCancellationCheck(std::shared_ptr<QSemaphore> barrier)
+{
+    d->testBarrierBeforeCancellationCheck = std::move(barrier);
+}
+
+void ArchiveExtractionJob::setTestBeforeCancellationCheckCallback(std::function<void()> callback)
+{
+    d->testBeforeCancellationCheckCallback = std::move(callback);
+}
+
+void ArchiveExtractionJob::setTestBeforeCopyToCallback(std::function<void()> callback)
+{
+    d->testBeforeCopyToCallback = std::move(callback);
+}
+
+void ArchiveExtractionJob::setTestWorkerStartedCallback(std::function<void()> callback)
+{
+    d->testWorkerStartedCallback = std::move(callback);
+}
+
+const std::function<void()>& ArchiveExtractionJob::testBeforeCancellationCheckCallback() const
+{
+    return d->testBeforeCancellationCheckCallback;
+}
+
+const std::function<void()>& ArchiveExtractionJob::testAboutToCopyToCallback() const
+{
+    return d->testAboutToCopyToCallback;
+}
+
+void ArchiveExtractionJob::setTestAboutToCopyToCallback(std::function<void()> callback)
+{
+    d->testAboutToCopyToCallback = std::move(callback);
+}
+
+const std::function<void(ArchiveExtractionWorker::ResultType)>& ArchiveExtractionJob::testWorkerResultCallback() const
+{
+    return d->testWorkerResultCallback;
+}
+
+void ArchiveExtractionJob::setTestWorkerResultCallback(std::function<void(ArchiveExtractionWorker::ResultType)> callback)
+{
+    d->testWorkerResultCallback = std::move(callback);
+}
+
+const std::function<void()>& ArchiveExtractionJob::testWorkerStartedCallback() const
+{
+    return d->testWorkerStartedCallback;
+}
+
+const std::function<void()>& ArchiveExtractionJob::testBeforeCopyToCallback() const
+{
+    return d->testBeforeCopyToCallback;
+}
+
+const std::function<void()>& ArchiveExtractionJob::testPreCopyToCallback() const
+{
+    return d->testPreCopyToCallback;
+}
+
+void ArchiveExtractionJob::setTestPreCopyToCallback(std::function<void()> callback)
+{
+    d->testPreCopyToCallback = std::move(callback);
+}
+
+void ArchiveExtractionJob::setStandardResourceDirectory(const QString &resourceDir)
+{
+    d->standardResourceDirectory = resourceDir;
+}
+
+const QString &ArchiveExtractionJob::standardResourceDirectory() const
+{
+    return d->standardResourceDirectory;
+}
+
+std::shared_ptr<std::atomic<bool>> ArchiveExtractionJob::cancellationFlag() const
+{
+    return d->cancellation;
+}
+
+void ArchiveExtractionJob::setExtractionHandle(int handle)
+{
+    d->extractionHandle = handle;
+}
+
+bool ArchiveExtractionJob::doKill()
+{
+    d->cancellation->store(true, std::memory_order_release);
+    d->killRequested = true;
+
+    // If already finished, nothing to do
+    if (d->finished) {
+        return true;
+    }
+
+    // If extraction hasn't started yet, we can finish immediately
+    if (d->extractionHandle == -1) {
+        return true;
+    }
+
+    // Request cancellation through manager
+    ArchiveExtractionManager::instance().requestCancellation(d->extractionHandle);
+
+    // Return false - job will finish when worker completes and emits result
+    return false;
+}
+
+void ArchiveExtractionJob::handleSuccess(const QStringList &files)
+{
+    // Must be called from the job's owning thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    qCDebug(KNEWSTUFFCORE) << "Job handleSuccess called, finished=" << d->finished << "isFinished=" << isFinished();
+    if (d->finished || isFinished()) {
+        return;
+    }
+    d->finished = true;
+    d->installedFiles = files;
+    qCDebug(KNEWSTUFFCORE) << "Job emitting result signal";
+    emitResult();
+}
+
+void ArchiveExtractionJob::handleFallbackRequired()
+{
+    // Must be called from the job's owning thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    if (d->finished || isFinished()) {
+        return;
+    }
+    d->finished = true;
+    setProperty("fallbackRequired", true);
+    emitResult();
+}
+
+void ArchiveExtractionJob::handleExtractionFailed(const QString &errorMessage)
+{
+    // Must be called from the job's owning thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    if (d->finished || isFinished()) {
+        return;
+    }
+    d->finished = true;
+    setError(KJob::UserDefinedError);
+    setErrorText(errorMessage);
+    emitResult();
+}
+
+void ArchiveExtractionJob::handleCancelled()
+{
+    // Must be called from the job's owning thread (main thread)
+    Q_ASSERT(QThread::currentThread() == thread());
+
+    if (d->finished || isFinished()) {
+        return;
+    }
+    d->finished = true;
+    setError(KJob::KilledJobError);
+    setErrorText(i18n("Archive extraction was cancelled"));
+    emitResult();
+}
+
+================================================================================
+END OF BUNDLE FILE 2
+================================================================================

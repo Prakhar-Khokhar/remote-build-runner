@@ -1,0 +1,57 @@
+===============================================================================
+REVIEW BUNDLE 1 of 7 - REPOSITORY STATE AND COMPLETE UNOMITTED git diff HEAD
+===============================================================================
+
+Repository root : /home/prakhar/Github Projects/knewstuff
+Branch          : fix/install-freeze
+HEAD commit     : cfaf92bbc888d2bfdbed97f06330c4f534eae1f7
+Generated (UTC) : 2026-11-13 16:31:43 UTC
+
+The repository was NOT modified while producing this bundle. Only the build-tree
+artifact build/autotests/core/data/testfile.txt was restored (copy of the tracked
+source autotests/core/data/testfile.txt) so that the pre-existing test
+testNonArchiveFile could find its fixture. No source file was edited, staged,
+committed, reset, stashed, or cleaned.
+
+-------------------------------------------------------------------------------
+SECTION A: git status --short
+-------------------------------------------------------------------------------
+ M autotests/core/CMakeLists.txt
+ M autotests/core/installationtest.cpp
+ M src/core/CMakeLists.txt
+ M src/core/installation.cpp
+ M src/core/installation_p.h
+?? .LKEYug
+?? .RJnCXA
+?? .fGxsQW
+?? .kilo/
+?? .mHxPqX
+?? .wggnhr
+?? LIFECYCLE_PROPOSAL.md
+?? autotests/core/archiveextractionjobtest.cpp
+?? autotests/core/archiveextractionjobtest.cpp.bak
+?? knewstuff-audit-source.txt
+?? src/core/filesystemmutex.cpp
+?? src/core/filesystemmutex.h
+?? src/core/jobs/archiveextractionjob.cpp
+?? src/core/jobs/archiveextractionjob.h
+?? src/core/jobs/archiveextractionmanager.cpp
+?? src/core/jobs/archiveextractionmanager.h
+?? src/core/jobs/archiveextractionworker.cpp
+?? src/core/jobs/archiveextractionworker.h
+?? src/qtquick/.qmlls.ini
+?? src/qtquick/private/.qmlls.ini
+
+-------------------------------------------------------------------------------
+SECTION B: git diff HEAD --stat
+-------------------------------------------------------------------------------
+ autotests/core/CMakeLists.txt       |   5 +
+ autotests/core/installationtest.cpp | 820 +++++++++++++++++++++++++++++++++++-
+ src/core/CMakeLists.txt             |   6 +-
+ src/core/installation.cpp           | 458 ++++++++++----------
+ src/core/installation_p.h           |  14 +
+ 5 files changed, 1067 insertions(+), 236 deletions(-)
+
+-------------------------------------------------------------------------------
+SECTION C: git diff HEAD  (COMPLETE, UNOMITTED, NO TRUNCATION)
+-------------------------------------------------------------------------------
